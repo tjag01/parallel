@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+# cc-parallel: run several Claude Code agents side by side, one per git worktree ("lane"), in tmux.
+# Watch them all on one tiled screen, see each lane's state (working, idle, waiting) from Claude Code hooks,
+# and let a supervisor (you, or another agent) drive the lanes through a checked file inbox.
+#
+#   cc-parallel help            the commands
+#   https://github.com/tjag01/parallel
+#
+# MIT licence. Requires bash 4+, tmux 3+, git, and Claude Code (`claude` on PATH).
+set -uo pipefail
+
+VERSION="0.1.0"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+CONF="${CC_PARALLEL_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/cc-parallel/config}"
+CONF_DIR="$(dirname "$CONF")"
+
+# ---------------------------------------------------------------------------------------------------------------
+# Defaults. The config file (plain bash, `cc-parallel init` writes one) overrides any of these.
+# ---------------------------------------------------------------------------------------------------------------
+SESSION="parallel"                 # tmux session holding the lanes
+REPO=""                            # the main checkout; the first lane runs here
+LANES="A B C D"                    # lane names: letters or digits, as many as you like
+WORKTREE_ROOT=""                   # other lanes live at $WORKTREE_ROOT/<lane, lower case>; default "$REPO-lanes"
+PROMPT_DIR="$HOME/Downloads"       # where task, sprint and ruling files are read from
+MODELS="opus sonnet"               # models a launch may name
+DEFAULT_MODEL="opus"
+DEFAULT_MODE="task"                # task | sprint | ground | resume (templates in $CONF_DIR/kickoff/)
+CLAUDE_BIN="claude"                # the Claude Code command
+CLAUDE_FLAGS=""                    # extra flags for every launch, e.g. "--dangerously-skip-permissions" (read the README first)
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cc-parallel"
+CC_PROCS="claude"                  # pane commands that mean "Claude Code is running in this lane"
+RELAY_TEXT='Read {path} whole (sha256 starts {sha8}) and follow it.'
+ON_CHANGE=""                       # run when a lane turns idle or waiting; gets LANE, STATE, EVENT in its env
+POLL=10                            # relay poll, seconds
+WALL_MAX="${WALL_MAX:-9}"                         # lanes per wall before cc-parallel asks you to pick a subset
+
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+
+die() { echo "cc-parallel: $*" >&2; exit 2; }
+lanes() { local l; for l in $LANES; do printf '%s\n' "$l"; done; }
+is_lane() { local l; for l in $LANES; do [ "$l" = "$1" ] && return 0; done; return 1; }
+first_lane() { set -- $LANES; printf '%s' "$1"; }
+lane_dir() { # lane -> its directory
+  local v="LANE_DIR_$1"
+  if [ -n "${!v:-}" ]; then printf '%s' "${!v}"
+  elif [ "$1" = "$(first_lane)" ]; then printf '%s' "$REPO"
+  else printf '%s/%s' "${WORKTREE_ROOT:-$REPO-lanes}" "${1,,}"; fi
+}
+need_repo() { [ -n "$REPO" ] || die "no REPO set; run: cc-parallel init --repo <path>"; }
+sha8() { sha256sum -- "$1" 2>/dev/null | cut -c1-8; }
+now() { date -u +%FT%TZ; }
+
+RELAY="$STATE_DIR/relay"
+STATUS="$STATE_DIR/status"
+
+# ---------------------------------------------------------------------------------------------------------------
+# init: write a config and default kickoff templates (never overwriting), and create the lanes' worktrees.
+# ---------------------------------------------------------------------------------------------------------------
+cmd_init() {
+  local n="" repo="" lanes_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$(readlink -f "$2")"; shift 2 ;;
+      --lanes) n="$2"; shift 2 ;;
+      --names) lanes_arg="$2"; shift 2 ;;
+      *) die "init: unknown argument $1" ;;
+    esac
+  done
+  [ -n "$repo" ] || repo="${REPO:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
+  [ -n "$repo" ] && git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die "init: --repo must be a git checkout"
+  if [ -n "$lanes_arg" ]; then LANES="$lanes_arg"
+  elif [ -n "$n" ]; then
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le 26 ] || die "init: --lanes takes 1..26 (or use --names \"a b c\")"
+    LANES="$(echo {A..Z} | cut -d' ' -f1-"$n")"
+  fi
+  REPO="$repo"
+  mkdir -p "$CONF_DIR/kickoff"
+  if [ -f "$CONF" ]; then
+    echo "config exists, left as it is: $CONF (edit LANES and REPO there to change lanes)"
+  else
+    cat >"$CONF" <<EOF
+# cc-parallel config (bash). Written by cc-parallel init on $(now).
+SESSION="$SESSION"
+REPO="$REPO"
+LANES="$LANES"
+# WORKTREE_ROOT="$REPO-lanes"      # other lanes: \$WORKTREE_ROOT/<lane in lower case>
+# LANE_DIR_B="/some/other/path"   # or set any lane's directory by hand
+PROMPT_DIR="$PROMPT_DIR"
+MODELS="$MODELS"
+DEFAULT_MODEL="$DEFAULT_MODEL"
+DEFAULT_MODE="$DEFAULT_MODE"
+CLAUDE_FLAGS=""
+# ON_CHANGE='notify-send "lane \$LANE is \$STATE"'
+EOF
+    echo "wrote $CONF"
+  fi
+  write_default_kickoffs
+  local l d
+  for l in $LANES; do
+    d="$(lane_dir "$l")"
+    if [ -d "$d" ]; then echo "lane $l: $d"; continue; fi
+    mkdir -p "$(dirname "$d")"
+    if git -C "$REPO" worktree add -b "parallel/${l,,}" "$d" HEAD >/dev/null 2>&1 \
+       || git -C "$REPO" worktree add "$d" "parallel/${l,,}" >/dev/null 2>&1; then
+      echo "lane $l: $d (new worktree, branch parallel/${l,,})"
+    else
+      echo "lane $l: could not create a worktree at $d; create it yourself or set LANE_DIR_$l" >&2
+    fi
+  done
+  echo "next: cc-parallel up   (then: cc-parallel wall)"
+}
+
+write_default_kickoffs() {
+  local k="$CONF_DIR/kickoff"
+  [ -f "$k/task.txt" ] || cat >"$k/task.txt" <<'EOF'
+[{code} · lane {lane}] Read {path} whole and carry it out in this directory. You are one of several agents working in parallel, each in its own git worktree: stay inside this worktree. If anything in the file contradicts what you find, or you are unsure, stop and report instead of improvising.
+EOF
+  [ -f "$k/sprint.txt" ] || cat >"$k/sprint.txt" <<'EOF'
+[{code} · lane {lane}] Execute the sprint file {path}. Run its verified-assumptions step first and stop on any STOP condition. Halt and report on any contradiction, unexpected result or ambiguity; never improvise past a stop. Commit and push after each step exactly as the file says. Read the report's deviations first when you write it. Do not propose or suggest next-sprint commands.
+EOF
+  [ -f "$k/ground.txt" ] || cat >"$k/ground.txt" <<'EOF'
+[{code} · lane {lane} · read-only] Execute {path}. It is a read-only investigation: no edits, no commits, no builds unless it says so. Write exactly the one report file it names. Cite file:line for every claim; what you cannot cite goes under "Unverified".
+EOF
+  [ -f "$k/resume.txt" ] || cat >"$k/resume.txt" <<'EOF'
+[{code} · lane {lane} · resume] You are resuming work in this lane in a fresh session. First read the sprint or task file this lane committed for {code} and its latest evidence, and run git status and git log -5. Then read {path} whole and follow it.
+EOF
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# up: the tmux session (a "relay" window plus one window per lane) and the relay watcher.
+# ---------------------------------------------------------------------------------------------------------------
+cmd_up() {
+  need_repo
+  command -v tmux >/dev/null || die "tmux is not installed"
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    tmux new-session -d -s "$SESSION" -n relay -c "$HOME"; echo "created session $SESSION"
+  fi
+  local l d
+  for l in $LANES; do
+    d="$(lane_dir "$l")"; [ -d "$d" ] || { echo "lane $l: $d does not exist (run cc-parallel init)" >&2; continue; }
+    tmux list-windows -t "$SESSION" -F '#W' | grep -qx -- "$l" || { tmux new-window -d -t "$SESSION" -n "$l" -c "$d"; echo "created window $l"; }
+  done
+  tmux set-option -t "$SESSION" history-limit 20000 >/dev/null
+  if relay_running; then echo "relay already running"
+  else tmux send-keys -t "$SESSION:relay" C-u "$(printf '%q' "$SELF") relay" Enter; echo "relay started in window relay"; fi
+  echo "view: cc-parallel wall   ·   attach: tmux attach -t $SESSION"
+}
+relay_running() { [ -f "$RELAY/log/relay.pid" ] && kill -0 "$(cat "$RELAY/log/relay.pid")" 2>/dev/null; }
+
+# ---------------------------------------------------------------------------------------------------------------
+# wall: every lane (or the ones you name) tiled on one screen, on a separate tmux server so it never
+# changes the lanes. Ctrl-a is its prefix: Ctrl-a z zooms a lane, Ctrl-a d closes the wall.
+# ---------------------------------------------------------------------------------------------------------------
+cmd_wall() {
+  local rebuild=0 sel=() l
+  while [ $# -gt 0 ]; do case "$1" in --rebuild) rebuild=1 ;; *) is_lane "$1" || die "wall: no lane $1"; sel+=("$1") ;; esac; shift; done
+  [ ${#sel[@]} -gt 0 ] || mapfile -t sel < <(lanes)
+  [ ${#sel[@]} -le "$WALL_MAX" ] || die "wall: ${#sel[@]} lanes is too many for one screen; name up to $WALL_MAX, e.g. cc-parallel wall ${sel[*]:0:4} (and open a second wall in another terminal)"
+  tmux has-session -t "$SESSION" 2>/dev/null || cmd_up >/dev/null
+  local tag; tag="$(printf '%s' "${sel[*]}" | tr -c 'A-Za-z0-9' '_')"
+  local W=(tmux -L "${SESSION}-wall-${tag}")
+  [ "$rebuild" = 1 ] && "${W[@]}" kill-server 2>/dev/null
+  for l in "${sel[@]}"; do
+    tmux has-session -t "${SESSION}-view-$l" 2>/dev/null || tmux new-session -d -t "$SESSION" -s "${SESSION}-view-$l"
+    tmux select-window -t "${SESSION}-view-$l:$l"
+  done
+  if ! "${W[@]}" has-session -t wall 2>/dev/null; then
+    "${W[@]}" -f /dev/null new-session -d -s wall -n lanes -x 240 -y 60 "env -u TMUX tmux attach -t ${SESSION}-view-${sel[0]}"
+    "${W[@]}" set-option -g prefix C-a; "${W[@]}" unbind-key C-b; "${W[@]}" bind-key C-a send-prefix
+    "${W[@]}" set-option -g mouse on
+    "${W[@]}" set-option -g status-left "parallel · ${sel[*]}  "
+    "${W[@]}" set-option -g status-right "click to focus · Ctrl-a z zoom · Ctrl-a d close"
+    "${W[@]}" set-option -g pane-border-status top
+    "${W[@]}" set-option -g pane-border-format ' lane #{pane_title} '
+    "${W[@]}" select-pane -t wall:lanes.0 -T "${sel[0]}"
+    local i
+    for ((i = 1; i < ${#sel[@]}; i++)); do
+      "${W[@]}" split-window -t wall:lanes "env -u TMUX tmux attach -t ${SESSION}-view-${sel[$i]}"
+      "${W[@]}" select-pane -T "${sel[$i]}"
+      "${W[@]}" select-layout -t wall:lanes tiled >/dev/null
+    done
+  fi
+  [ -n "${CC_PARALLEL_NO_ATTACH:-}" ] && return 0
+  exec "${W[@]}" attach -t wall
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# launch: start Claude Code in a lane on a file from PROMPT_DIR, with the kickoff for its mode and the status hooks.
+# ---------------------------------------------------------------------------------------------------------------
+cmd_launch() {
+  local lane="${1:-}" file="${2:-}" model="${3:-$DEFAULT_MODEL}" mode="${4:-}"
+  is_lane "$lane" || die "launch: usage: cc-parallel launch <lane> <file in $PROMPT_DIR> [model] [task|sprint|ground|resume]"
+  local path="$PROMPT_DIR/$file" dir; dir="$(lane_dir "$lane")"
+  [ -n "$file" ] && [ -f "$path" ] || die "launch: not found: $path"
+  [ -d "$dir" ] || die "launch: lane directory not found: $dir"
+  case " $MODELS " in *" $model "*) ;; *) die "launch: model must be one of: $MODELS" ;; esac
+  if [ -z "$mode" ]; then
+    if head -n 12 -- "$path" | grep -qi '^\*\*Kind:\*\* a read-only'; then mode=ground; else mode="$DEFAULT_MODE"; fi
+  fi
+  local tpl="$CONF_DIR/kickoff/$mode.txt"
+  [ -f "$tpl" ] || { write_default_kickoffs; [ -f "$tpl" ] || die "launch: no kickoff template $tpl"; }
+  local code; code="$(sed -n '1s/^# *\([A-Za-z0-9][A-Za-z0-9_.-]*\)[ :·].*/\1/p' -- "$path")"
+  [ -n "$code" ] || code="$(basename -- "$file" .md)"
+  local prompt; prompt="$(<"$tpl")"
+  prompt="${prompt//\{path\}/$path}"; prompt="${prompt//\{file\}/$file}"
+  prompt="${prompt//\{lane\}/$lane}"; prompt="${prompt//\{code\}/$code}"
+  local q; q="$(printf '%q' "$SELF")"
+  local settings
+  settings=$(printf '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"%s hook working"}]}],"PreToolUse":[{"hooks":[{"type":"command","command":"%s hook working"}]}],"Notification":[{"hooks":[{"type":"command","command":"%s hook waiting"}]}],"Stop":[{"hooks":[{"type":"command","command":"%s hook idle"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"%s hook ended"}]}]}}' "$q" "$q" "$q" "$q" "$q")
+  mkdir -p "$STATUS"
+  printf 'starting %s launch %s %s\n' "$(date +%s)" "$code" "$mode" >"$STATUS/$lane"
+  echo "lane $lane · $dir · $code · $model · $mode"
+  cd "$dir" || die "launch: cannot cd to $dir"
+  export CC_PARALLEL_LANE="$lane" CC_PARALLEL_STATUS="$STATUS"
+  # shellcheck disable=SC2086
+  exec "$CLAUDE_BIN" --model "$model" --settings "$settings" $CLAUDE_FLAGS "$prompt"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# hook: called by Claude Code's hooks (installed per launch with --settings); records the lane's state.
+# ---------------------------------------------------------------------------------------------------------------
+cmd_hook() {
+  local state="${1:-}" lane="${CC_PARALLEL_LANE:-}" dir="${CC_PARALLEL_STATUS:-$STATUS}"
+  cat >/dev/null 2>&1 || true            # the hook's JSON on stdin; not needed
+  [ -n "$lane" ] || exit 0
+  case "$state" in working|waiting|idle|ended) ;; *) exit 0 ;; esac
+  mkdir -p "$dir" 2>/dev/null || exit 0
+  printf '%s %s hook\n' "$state" "$(date +%s)" >"$dir/.$lane.$$" && mv -f "$dir/.$lane.$$" "$dir/$lane"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# status: one line per lane.
+# ---------------------------------------------------------------------------------------------------------------
+cmd_status() {
+  local l st ts age cmd
+  printf '%-6s %-9s %-8s %-10s %s\n' LANE STATE FOR PANE DIRECTORY
+  for l in $LANES; do
+    st="-"; age="-"
+    if [ -f "$STATUS/$l" ]; then
+      read -r st ts _ <"$STATUS/$l"
+      local s=$(( $(date +%s) - ${ts:-0} ))
+      if [ "$s" -lt 60 ]; then age="${s}s"; elif [ "$s" -lt 3600 ]; then age="$((s / 60))m"; else age="$((s / 3600))h"; fi
+    fi
+    cmd="$(tmux display-message -p -t "$SESSION:$l" '#{pane_current_command}' 2>/dev/null || echo '-')"
+    printf '%-6s %-9s %-8s %-10s %s\n' "$l" "$st" "$age" "$cmd" "$(lane_dir "$l")"
+  done
+  relay_running && echo "relay: running (heartbeat $(cat "$RELAY/log/heartbeat" 2>/dev/null))" || echo "relay: not running (cc-parallel up starts it)"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# send / queue: how a supervisor talks to the relay. Each writes one checked file into the inbox.
+#   send  <lane> <file>                       type RELAY_TEXT for that file into the lane's running session
+#   queue <lane> <file> [model] [mode] [--exit]  launch the file in the lane once it is at a shell
+#                                               (--exit: send /exit to a lane still running Claude Code first)
+# ---------------------------------------------------------------------------------------------------------------
+cmd_send() {
+  local lane="${1:-}" file="${2:-}"; is_lane "$lane" && [ -f "$PROMPT_DIR/$file" ] || die "send: usage: cc-parallel send <lane> <file in $PROMPT_DIR>"
+  mkdir -p "$RELAY/inbox"
+  printf '%s %s\n' "$file" "$(sha8 "$PROMPT_DIR/$file")" >"$RELAY/inbox/$lane-$(date -u +%Y%m%dT%H%M%S)-relay.txt"
+  echo "queued for lane $lane: $file"
+}
+cmd_queue() {
+  local lane="${1:-}" file="${2:-}" model="${3:-$DEFAULT_MODEL}" mode="${4:-$DEFAULT_MODE}" ex=""
+  local a; for a in "$@"; do [ "$a" = --exit ] && ex="exit"; done
+  [ "$model" = --exit ] && model="$DEFAULT_MODEL"; [ "$mode" = --exit ] && mode="$DEFAULT_MODE"
+  is_lane "$lane" && [ -f "$PROMPT_DIR/$file" ] || die "queue: usage: cc-parallel queue <lane> <file in $PROMPT_DIR> [model] [mode] [--exit]"
+  mkdir -p "$RELAY/inbox"
+  printf '%s %s %s %s %s\n' "$file" "$model" "$mode" "$(sha8 "$PROMPT_DIR/$file")" "$ex" | sed 's/ *$//' \
+    >"$RELAY/inbox/$lane-$(date -u +%Y%m%dT%H%M%S)-launch.txt"
+  echo "queued launch for lane $lane: $file ($model, $mode${ex:+, exit first})"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# relay: the watcher. It never runs what a file says. It types one composed, checked line into a lane, or
+# starts `cc-parallel launch` there. Files are moved to sent/ or rejected/, never deleted.
+# ---------------------------------------------------------------------------------------------------------------
+cmd_relay() {
+  need_repo
+  mkdir -p "$RELAY"/{inbox,sent,rejected,panes,log} "$STATUS"
+  local LOG="$RELAY/log/relay.log"
+  log() { printf '%s %s\n' "$(now)" "$*" >>"$LOG"; }
+  pane_cmd() { tmux display-message -p -t "$SESSION:$1" '#{pane_current_command}' 2>/dev/null; }
+  is_cc() { local c p; c="$(pane_cmd "$1")"; for p in $CC_PROCS; do [ "$c" = "$p" ] && return 0; done; return 1; }
+  is_shell() { case "$(pane_cmd "$1")" in bash|zsh|sh|fish) return 0 ;; *) return 1 ;; esac; }
+  has_win() { tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx -- "$1"; }
+  reject() { log "REJECT $1: $2"; mv -n -- "$RELAY/inbox/$1" "$RELAY/rejected/$1"; }
+  sent() { log "SENT $1: $2"; mv -n -- "$RELAY/inbox/$1" "$RELAY/sent/$1"; }
+  type_line() { tmux send-keys -t "$SESSION:$1" -l -- "$2" && sleep 0.7 && tmux send-keys -t "$SESSION:$1" Enter; }
+
+  snapshot() {
+    local l out
+    for l in $LANES; do
+      has_win "$l" || continue
+      out="$RELAY/panes/.$l.tmp"
+      { printf 'lane %s · %s · pane: %s\n\n' "$l" "$(now)" "$(pane_cmd "$l")"
+        tmux capture-pane -p -J -t "$SESSION:$l" -S -200; } >"$out" 2>/dev/null && mv -f -- "$out" "$RELAY/panes/$l.txt"
+    done
+  }
+
+  declare -A LAST=()
+  watch_states() {
+    local l st _x
+    for l in $LANES; do
+      [ -f "$STATUS/$l" ] || continue
+      read -r st _x <"$STATUS/$l"
+      if [ "${LAST[$l]:-}" != "$st" ]; then
+        [ -n "${LAST[$l]:-}" ] && log "STATE $l ${LAST[$l]} -> $st"
+        if [ -n "${LAST[$l]:-}" ] && [ -n "$ON_CHANGE" ] && { [ "$st" = idle ] || [ "$st" = waiting ]; }; then
+          LANE="$l" STATE="$st" EVENT="${LAST[$l]}->$st" bash -c "$ON_CHANGE" >>"$LOG" 2>&1 &
+        fi
+        LAST[$l]="$st"
+      fi
+    done
+  }
+
+  handle() {
+    local f="$1" path="$RELAY/inbox/$1" lane kind line
+    [[ "$f" =~ ^([A-Za-z0-9]+)-[0-9]{8}T[0-9]{6}-(relay|launch)\.txt$ ]] || { reject "$f" "bad name"; return; }
+    lane="${BASH_REMATCH[1]}"; kind="${BASH_REMATCH[2]}"
+    is_lane "$lane" || { reject "$f" "no lane $lane"; return; }
+    [ -f "$path" ] && [ ! -L "$path" ] || { reject "$f" "not a regular file"; return; }
+    [ "$(stat -c %s -- "$path")" -lt 1024 ] || { reject "$f" "too large"; return; }
+    [ "$(grep -c '' -- "$path")" -eq 1 ] || { reject "$f" "not exactly one line"; return; }
+    line="$(head -n1 -- "$path" | tr -d '\r')"
+    [[ "$line" =~ ^[A-Za-z0-9\ ._-]+$ ]] || { reject "$f" "disallowed characters"; return; }
+    has_win "$lane" || { log "HOLD $f: no window $lane"; return; }
+
+    if [ "$kind" = relay ]; then
+      local file s8 extra
+      read -r file s8 extra <<<"$line"
+      [[ "$file" =~ ^[A-Za-z0-9_.-]+$ ]] && [[ "$s8" =~ ^[0-9a-f]{8}$ ]] && [ -z "$extra" ] || { reject "$f" "want: <file> <sha8>"; return; }
+      [ "$(sha8 "$PROMPT_DIR/$file")" = "$s8" ] || { reject "$f" "$file missing or its sha256 is not $s8"; return; }
+      is_cc "$lane" || { log "HOLD $f: lane $lane is at '$(pane_cmd "$lane")', not Claude Code"; return; }
+      local text="$RELAY_TEXT"; text="${text//\{path\}/$PROMPT_DIR/$file}"; text="${text//\{file\}/$file}"; text="${text//\{sha8\}/$s8}"
+      tmux send-keys -t "$SESSION:$lane" C-u
+      type_line "$lane" "$text" && sent "$f" "typed into $lane ($file $s8)"
+      return
+    fi
+
+    local file model mode s8 ex extra
+    read -r file model mode s8 ex extra <<<"$line"
+    [[ "$file" =~ ^[A-Za-z0-9_.-]+$ ]] || { reject "$f" "bad file name"; return; }
+    case " $MODELS " in *" $model "*) ;; *) reject "$f" "model must be one of: $MODELS"; return ;; esac
+    [[ "$mode" =~ ^(task|sprint|ground|resume)$ ]] || { reject "$f" "bad mode"; return; }
+    [[ "$s8" =~ ^[0-9a-f]{8}$ ]] && [ "$(sha8 "$PROMPT_DIR/$file")" = "$s8" ] || { reject "$f" "$file missing or its sha256 is not $s8"; return; }
+    { [ -z "$ex" ] || [ "$ex" = exit ]; } && [ -z "$extra" ] || { reject "$f" "5th field must be empty or exit"; return; }
+    if is_cc "$lane"; then
+      if [ "$ex" = exit ] && [ ! -e "$RELAY/inbox/.exit-sent-$f" ]; then
+        tmux send-keys -t "$SESSION:$lane" C-u; type_line "$lane" "/exit"; : >"$RELAY/inbox/.exit-sent-$f"; log "EXIT sent to $lane for $f"
+      fi
+      log "HOLD $f: lane $lane still running Claude Code"; return
+    fi
+    is_shell "$lane" || { log "HOLD $f: lane $lane is at '$(pane_cmd "$lane")'"; return; }
+    type_line "$lane" "$(printf '%q' "$SELF") launch $lane $file $model $mode" && sent "$f" "launched $lane $file $model $mode"
+    [ -e "$RELAY/inbox/.exit-sent-$f" ] && mv -f -- "$RELAY/inbox/.exit-sent-$f" "$RELAY/sent/.exit-sent-$f"
+  }
+
+  if relay_running; then die "relay: already running (pid $(cat "$RELAY/log/relay.pid"))"; fi
+  echo $$ >"$RELAY/log/relay.pid"
+  trap '' INT
+  trap 'log "EXIT relay (pid $$)"' EXIT
+  trap 'log "TERM relay (pid $$)"; exit 143' TERM
+  log "START relay $VERSION (pid $$) lanes: $LANES"
+  echo "relay $VERSION watching $RELAY/inbox (Ctrl-C is ignored; stop it with: kill $$)"
+  local n=0 p
+  while :; do
+    [ $((n % 6)) -eq 0 ] && snapshot
+    watch_states
+    for p in "$RELAY"/inbox/*.txt; do [ -e "$p" ] || continue; handle "$(basename -- "$p")"; done
+    now >"$RELAY/log/heartbeat"
+    n=$((n + 1)); sleep "$POLL"
+  done
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+cmd_install_app() {
+  local d="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  mkdir -p "$d"
+  cat >"$d/cc-parallel.desktop" <<DESK
+[Desktop Entry]
+Type=Application
+Name=Parallel (Claude Code lanes)
+Comment=Every Claude Code lane on one screen
+Exec=$SELF wall
+Terminal=true
+Icon=utilities-terminal
+Categories=Development;
+DESK
+  update-desktop-database "$d" 2>/dev/null || true
+  echo "installed $d/cc-parallel.desktop"
+}
+
+cmd_help() {
+  cat <<EOF
+cc-parallel $VERSION: several Claude Code agents in parallel, one per git worktree, in tmux.
+
+  cc-parallel init --repo PATH [--lanes N | --names "a b c"]   config, kickoff templates, one worktree per lane
+  cc-parallel up                         the tmux session ($SESSION) and the relay watcher
+  cc-parallel wall [LANE...] [--rebuild] every lane (or the ones named) tiled on one screen
+  cc-parallel launch LANE FILE [MODEL] [MODE]   start Claude Code in a lane on a file from PROMPT_DIR
+  cc-parallel status                     each lane's state (working, waiting, idle, ended) and the relay
+  cc-parallel send LANE FILE             relay: type "read FILE and follow it" into a lane's running session
+  cc-parallel queue LANE FILE [MODEL] [MODE] [--exit]   relay: launch FILE in a lane once it is free
+  cc-parallel relay                      the watcher (cc-parallel up runs it in the relay window)
+  cc-parallel install-app                a desktop launcher that opens the wall
+
+Config: $CONF
+State:  $STATE_DIR
+Modes:  task, sprint, ground (read-only) and resume; edit the templates in $CONF_DIR/kickoff/
+EOF
+}
+
+sub="${1:-help}"; shift || true
+case "$sub" in
+  init) cmd_init "$@" ;;
+  up) cmd_up "$@" ;;
+  wall) cmd_wall "$@" ;;
+  launch) cmd_launch "$@" ;;
+  hook) cmd_hook "$@" ;;
+  status) cmd_status "$@" ;;
+  send) cmd_send "$@" ;;
+  queue) cmd_queue "$@" ;;
+  relay) cmd_relay "$@" ;;
+  install-app) cmd_install_app "$@" ;;
+  version|--version) echo "cc-parallel $VERSION" ;;
+  help|-h|--help) cmd_help ;;
+  *) die "unknown command $sub (cc-parallel help)" ;;
+esac
