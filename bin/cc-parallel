@@ -9,7 +9,7 @@
 # MIT licence. Requires bash 4+, tmux 3+, git, and Claude Code (`claude` on PATH).
 set -uo pipefail
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 CONF="${CC_PARALLEL_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/cc-parallel/config}"
 CONF_DIR="$(dirname "$CONF")"
@@ -321,6 +321,8 @@ cmd_relay() {
   has_win() { [ -n "$(win "$1")" ]; }
   reject() { log "REJECT $1: $2"; mv -n -- "$RELAY/inbox/$1" "$RELAY/rejected/$1"; }
   sent() { log "SENT $1: $2"; mv -n -- "$RELAY/inbox/$1" "$RELAY/sent/$1"; }
+  declare -A HELD=()
+  hold() { [ "${HELD[$1]:-}" = "$2" ] && return; HELD[$1]="$2"; log "HOLD $1: $2"; }  # once per file and reason, not every poll
   unmode() { # a pane in copy mode (scrolled back in the wall) would read typed keys as scroll commands; leave it first
     local w="$1"; [ "$(tmux display-message -p -t "$w" '#{pane_in_mode}' 2>/dev/null)" = 1 ] && tmux send-keys -t "$w" -X cancel && log "COPY-MODE left in $w before typing"; return 0; }
   type_line() { local w; w="$(win "$1")" || return 1; unmode "$w"; tmux send-keys -t "$w" -l -- "$2" && sleep 0.7 && tmux send-keys -t "$w" Enter; }
@@ -361,14 +363,14 @@ cmd_relay() {
     [ "$(grep -c '' -- "$path")" -eq 1 ] || { reject "$f" "not exactly one line"; return; }
     line="$(head -n1 -- "$path" | tr -d '\r')"
     [[ "$line" =~ ^[A-Za-z0-9\ ._-]+$ ]] || { reject "$f" "disallowed characters"; return; }
-    has_win "$lane" || { log "HOLD $f: no window $lane"; return; }
+    has_win "$lane" || { hold "$f" "no window $lane"; return; }
 
     if [ "$kind" = relay ]; then
       local file s8 extra
       read -r file s8 extra <<<"$line"
       [[ "$file" =~ ^[A-Za-z0-9_.-]+$ ]] && [[ "$s8" =~ ^[0-9a-f]{8}$ ]] && [ -z "$extra" ] || { reject "$f" "want: <file> <sha8>"; return; }
       [ "$(sha8 "$PROMPT_DIR/$file")" = "$s8" ] || { reject "$f" "$file missing or its sha256 is not $s8"; return; }
-      is_cc "$lane" || { log "HOLD $f: lane $lane is at '$(pane_cmd "$lane")', not Claude Code"; return; }
+      is_cc "$lane" || { hold "$f" "lane $lane is at '$(pane_cmd "$lane")', not Claude Code"; return; }
       local text="$RELAY_TEXT"; text="${text//\{path\}/$PROMPT_DIR/$file}"; text="${text//\{file\}/$file}"; text="${text//\{sha8\}/$s8}"
       unmode "$(win "$lane")"; tmux send-keys -t "$(win "$lane")" C-u
       type_line "$lane" "$text" && sent "$f" "typed into $lane ($file $s8)"
@@ -384,8 +386,8 @@ cmd_relay() {
     { [ -z "$ex" ] || [ "$ex" = exit ] || [ "$ex" = next ]; } && [ -z "$extra" ] || { reject "$f" "5th field must be empty, exit or next"; return; }
     if [ "$ex" = next ] && [ ! -e "$RELAY/inbox/.armed-$f" ]; then
       # One armed follow-on per lane at a time, and only once the current task has said it is done.
-      compgen -G "$RELAY/inbox/.armed-$lane-*" >/dev/null && { log "HOLD $f: another follow-on for $lane is starting"; return; }
-      [ -e "$STATUS/$lane.done" ] || { log "HOLD $f: lane $lane has not run cc-parallel done"; return; }
+      compgen -G "$RELAY/inbox/.armed-$lane-*" >/dev/null && { hold "$f" "another follow-on for $lane is starting"; return; }
+      [ -e "$STATUS/$lane.done" ] || { hold "$f" "lane $lane has not run cc-parallel done"; return; }
       mv -f -- "$STATUS/$lane.done" "$STATUS/$lane.done.used"; : >"$RELAY/inbox/.armed-$f"; log "DONE $lane: armed $f"
       GC_DUE=1
     fi
@@ -393,9 +395,9 @@ cmd_relay() {
       if { [ "$ex" = exit ] || [ "$ex" = next ]; } && [ ! -e "$RELAY/inbox/.exit-sent-$f" ]; then
         unmode "$(win "$lane")"; tmux send-keys -t "$(win "$lane")" C-u; type_line "$lane" "/exit"; : >"$RELAY/inbox/.exit-sent-$f"; log "EXIT sent to $lane for $f"
       fi
-      log "HOLD $f: lane $lane still running Claude Code"; return
+      hold "$f" "lane $lane still running Claude Code"; return
     fi
-    is_shell "$lane" || { log "HOLD $f: lane $lane is at '$(pane_cmd "$lane")'"; return; }
+    is_shell "$lane" || { hold "$f" "lane $lane is at '$(pane_cmd "$lane")'"; return; }
     type_line "$lane" "$(printf '%q' "$SELF") launch $lane $file $model $mode" && sent "$f" "launched $lane $file $model $mode"
     [ -e "$RELAY/inbox/.exit-sent-$f" ] && mv -f -- "$RELAY/inbox/.exit-sent-$f" "$RELAY/sent/.exit-sent-$f"
     [ -e "$RELAY/inbox/.armed-$f" ] && mv -f -- "$RELAY/inbox/.armed-$f" "$RELAY/sent/.armed-$f"

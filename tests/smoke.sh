@@ -79,6 +79,7 @@ printf '# T3 · follow-on\n' >"$HOME/Downloads/t3.md"
 sleep 4
 check "an --after-done launch waits while the lane has not run done" grep -qx sonnet "$HOME/claude-args-A"
 check "the relay logs why it is holding" grep -q "HOLD A-.*has not run cc-parallel done" "$XDG_STATE_HOME/cc-parallel/relay/log/relay.log"
+check "the relay logs a hold once, not on every poll" test "$(grep -c "HOLD A-.*has not run cc-parallel done" "$XDG_STATE_HOME/cc-parallel/relay/log/relay.log")" -eq 1
 CC_PARALLEL_LANE=A CC_PARALLEL_STATUS="$XDG_STATE_HOME/cc-parallel/status" "$CCP" "done" T2 >/dev/null
 check "done lets the follow-on start: /exit, then the launch" wait_for "grep -q 'T3 · lane A' '$HOME/claude-args-A' 2>/dev/null" 80
 check "the done marker is used once" test ! -e "$XDG_STATE_HOME/cc-parallel/status/A.done"

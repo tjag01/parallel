@@ -43,8 +43,20 @@ One bash script (`cc-parallel`), tmux and git. No daemon, no account, no network
 git clone https://github.com/tjag01/parallel ~/parallel
 ```
 ```
+mkdir -p ~/.local/bin
+```
+```
 ln -s ~/parallel/bin/cc-parallel ~/.local/bin/cc-parallel
 ```
+```
+cc-parallel --version
+```
+
+If the last command says `command not found`, `~/.local/bin` is not on your PATH yet. Add
+`export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` (or `~/.zshrc` on macOS), then open a new terminal.
+
+To update later: `git -C ~/parallel pull`. To pin a release instead of following `main`:
+`git -C ~/parallel checkout v0.2.2`.
 
 You need bash 4+, tmux 3+, git, and Claude Code installed and signed in (`claude` on your PATH). It is tested on
 Linux, and should work on macOS with Homebrew bash.
