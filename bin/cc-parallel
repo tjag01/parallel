@@ -9,7 +9,7 @@
 # MIT licence. Requires bash 4+, tmux 3+, git, and Claude Code (`claude` on PATH).
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.2"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 CONF="${CC_PARALLEL_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/cc-parallel/config}"
 CONF_DIR="$(dirname "$CONF")"
@@ -48,6 +48,8 @@ lane_dir() { # lane -> its directory
   else printf '%s/%s' "${WORKTREE_ROOT:-$REPO-lanes}" "${1,,}"; fi
 }
 need_repo() { [ -n "$REPO" ] || die "no REPO set; run: cc-parallel init --repo <path>"; }
+# A window by exact name, as session:index. tmux refuses a name two windows share, so never target by name.
+win() { local i; i="$(tmux list-windows -t "=$SESSION" -F '#{window_index} #{window_name}' 2>/dev/null | awk -v n="$1" '$2 == n { print $1; exit }')"; [ -n "$i" ] && printf '%s:%s' "$SESSION" "$i"; }
 sha8() { sha256sum -- "$1" 2>/dev/null | cut -c1-8; }
 now() { date -u +%FT%TZ; }
 
@@ -133,17 +135,24 @@ EOF
 cmd_up() {
   need_repo
   command -v tmux >/dev/null || die "tmux is not installed"
-  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
     tmux new-session -d -s "$SESSION" -n relay -c "$HOME"; echo "created session $SESSION"
   fi
   local l d
   for l in $LANES; do
     d="$(lane_dir "$l")"; [ -d "$d" ] || { echo "lane $l: $d does not exist (run cc-parallel init)" >&2; continue; }
-    tmux list-windows -t "$SESSION" -F '#W' | grep -qx -- "$l" || { tmux new-window -d -t "$SESSION" -n "$l" -c "$d"; echo "created window $l"; }
+    [ -n "$(win "$l")" ] || { tmux new-window -d -t "$SESSION" -n "$l" -c "$d"; echo "created window $l"; }
   done
-  tmux set-option -t "$SESSION" history-limit 20000 >/dev/null
+  tmux set-option -t "=$SESSION" history-limit 20000 >/dev/null
   if relay_running; then echo "relay already running"
-  else tmux send-keys -t "$SESSION:relay" C-u "$(printf '%q' "$SELF") relay" Enter; echo "relay started in window relay"; fi
+  else
+    [ -n "$(win relay)" ] || tmux new-window -d -t "=$SESSION" -n relay -c "$HOME"
+    if [ "$(tmux display-message -p -t "$(win relay)" '#{pane_current_command}')" = "${SHELL##*/}" ] || tmux display-message -p -t "$(win relay)" '#{pane_current_command}' | grep -qxE 'bash|zsh|sh|fish'; then
+      tmux send-keys -t "$(win relay)" C-u "$(printf '%q' "$SELF") relay" Enter; echo "relay started in window relay"
+    else
+      tmux new-window -d -t "=$SESSION" -n relay "$(printf '%q' "$SELF") relay; exec \"\${SHELL:-bash}\""; echo "relay started in a new relay window (the old one was busy)"
+    fi
+  fi
   echo "view: cc-parallel wall   ·   attach: tmux attach -t $SESSION"
 }
 relay_running() { [ -f "$RELAY/log/relay.pid" ] && kill -0 "$(cat "$RELAY/log/relay.pid")" 2>/dev/null; }
@@ -157,7 +166,7 @@ cmd_wall() {
   while [ $# -gt 0 ]; do case "$1" in --rebuild) rebuild=1 ;; *) is_lane "$1" || die "wall: no lane $1"; sel+=("$1") ;; esac; shift; done
   [ ${#sel[@]} -gt 0 ] || mapfile -t sel < <(lanes)
   [ ${#sel[@]} -le "$WALL_MAX" ] || die "wall: ${#sel[@]} lanes is too many for one screen; name up to $WALL_MAX, e.g. cc-parallel wall ${sel[*]:0:4} (and open a second wall in another terminal)"
-  tmux has-session -t "$SESSION" 2>/dev/null || cmd_up >/dev/null
+  tmux has-session -t "=$SESSION" 2>/dev/null || cmd_up >/dev/null
   local tag; tag="$(printf '%s' "${sel[*]}" | tr -c 'A-Za-z0-9' '_')"
   local W=(tmux -L "${SESSION}-wall-${tag}")
   [ "$rebuild" = 1 ] && "${W[@]}" kill-server 2>/dev/null
@@ -243,7 +252,7 @@ cmd_status() {
       local s=$(( $(date +%s) - ${ts:-0} ))
       if [ "$s" -lt 60 ]; then age="${s}s"; elif [ "$s" -lt 3600 ]; then age="$((s / 60))m"; else age="$((s / 3600))h"; fi
     fi
-    cmd="$(tmux display-message -p -t "$SESSION:$l" '#{pane_current_command}' 2>/dev/null || echo '-')"
+    cmd="$(tmux display-message -p -t "$(win "$l")" '#{pane_current_command}' 2>/dev/null || echo '-')"
     printf '%-6s %-9s %-8s %-10s %s\n' "$l" "$st" "$age" "$cmd" "$(lane_dir "$l")"
   done
   relay_running && echo "relay: running (heartbeat $(cat "$RELAY/log/heartbeat" 2>/dev/null))" || echo "relay: not running (cc-parallel up starts it)"
@@ -281,13 +290,15 @@ cmd_relay() {
   mkdir -p "$RELAY"/{inbox,sent,rejected,panes,log} "$STATUS"
   local LOG="$RELAY/log/relay.log"
   log() { printf '%s %s\n' "$(now)" "$*" >>"$LOG"; }
-  pane_cmd() { tmux display-message -p -t "$SESSION:$1" '#{pane_current_command}' 2>/dev/null; }
+  pane_cmd() { local w; w="$(win "$1")" && tmux display-message -p -t "$w" '#{pane_current_command}' 2>/dev/null; }
   is_cc() { local c p; c="$(pane_cmd "$1")"; for p in $CC_PROCS; do [ "$c" = "$p" ] && return 0; done; return 1; }
   is_shell() { case "$(pane_cmd "$1")" in bash|zsh|sh|fish) return 0 ;; *) return 1 ;; esac; }
-  has_win() { tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx -- "$1"; }
+  has_win() { [ -n "$(win "$1")" ]; }
   reject() { log "REJECT $1: $2"; mv -n -- "$RELAY/inbox/$1" "$RELAY/rejected/$1"; }
   sent() { log "SENT $1: $2"; mv -n -- "$RELAY/inbox/$1" "$RELAY/sent/$1"; }
-  type_line() { tmux send-keys -t "$SESSION:$1" -l -- "$2" && sleep 0.7 && tmux send-keys -t "$SESSION:$1" Enter; }
+  unmode() { # a pane in copy mode (scrolled back in the wall) would read typed keys as scroll commands; leave it first
+    local w="$1"; [ "$(tmux display-message -p -t "$w" '#{pane_in_mode}' 2>/dev/null)" = 1 ] && tmux send-keys -t "$w" -X cancel && log "COPY-MODE left in $w before typing"; return 0; }
+  type_line() { local w; w="$(win "$1")" || return 1; unmode "$w"; tmux send-keys -t "$w" -l -- "$2" && sleep 0.7 && tmux send-keys -t "$w" Enter; }
 
   snapshot() {
     local l out
@@ -295,7 +306,7 @@ cmd_relay() {
       has_win "$l" || continue
       out="$RELAY/panes/.$l.tmp"
       { printf 'lane %s · %s · pane: %s\n\n' "$l" "$(now)" "$(pane_cmd "$l")"
-        tmux capture-pane -p -J -t "$SESSION:$l" -S -200; } >"$out" 2>/dev/null && mv -f -- "$out" "$RELAY/panes/$l.txt"
+        tmux capture-pane -p -J -t "$(win "$l")" -S -200; } >"$out" 2>/dev/null && mv -f -- "$out" "$RELAY/panes/$l.txt"
     done
   }
 
@@ -334,7 +345,7 @@ cmd_relay() {
       [ "$(sha8 "$PROMPT_DIR/$file")" = "$s8" ] || { reject "$f" "$file missing or its sha256 is not $s8"; return; }
       is_cc "$lane" || { log "HOLD $f: lane $lane is at '$(pane_cmd "$lane")', not Claude Code"; return; }
       local text="$RELAY_TEXT"; text="${text//\{path\}/$PROMPT_DIR/$file}"; text="${text//\{file\}/$file}"; text="${text//\{sha8\}/$s8}"
-      tmux send-keys -t "$SESSION:$lane" C-u
+      unmode "$(win "$lane")"; tmux send-keys -t "$(win "$lane")" C-u
       type_line "$lane" "$text" && sent "$f" "typed into $lane ($file $s8)"
       return
     fi
@@ -348,7 +359,7 @@ cmd_relay() {
     { [ -z "$ex" ] || [ "$ex" = exit ]; } && [ -z "$extra" ] || { reject "$f" "5th field must be empty or exit"; return; }
     if is_cc "$lane"; then
       if [ "$ex" = exit ] && [ ! -e "$RELAY/inbox/.exit-sent-$f" ]; then
-        tmux send-keys -t "$SESSION:$lane" C-u; type_line "$lane" "/exit"; : >"$RELAY/inbox/.exit-sent-$f"; log "EXIT sent to $lane for $f"
+        unmode "$(win "$lane")"; tmux send-keys -t "$(win "$lane")" C-u; type_line "$lane" "/exit"; : >"$RELAY/inbox/.exit-sent-$f"; log "EXIT sent to $lane for $f"
       fi
       log "HOLD $f: lane $lane still running Claude Code"; return
     fi

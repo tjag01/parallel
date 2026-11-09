@@ -45,17 +45,21 @@ check "init writes the four kickoff templates" test "$(ls "$XDG_CONFIG_HOME/cc-p
 check "up makes the session with a relay window and six lane windows" test "$(tmux list-windows -t parallel | wc -l)" -eq 7
 check "up starts the relay" wait_for "[ -f '$XDG_STATE_HOME/cc-parallel/relay/log/heartbeat' ]"
 
+tmux new-window -d -t parallel -n relay; tmux new-window -d -t parallel -n A   # duplicate names, as a real session collects
+check "up copes with two windows of one name" bash -c "'$CCP' up 2>&1 | grep -qv \"can't find\""
+
 printf '# T1 · first task\nDo the thing.\n' >"$HOME/Downloads/t1.md"
 "$CCP" queue A t1.md opus task >/dev/null
 check "a queued launch starts Claude Code in lane A" wait_for "[ -f '$HOME/claude-args-A' ]"
 check "the launch passes the model" grep -qx opus "$HOME/claude-args-A"
 check "the launch passes the hooks through --settings" grep -q '"Stop"' "$HOME/claude-args-A"
 check "the kickoff names the file and the code" grep -q "\[T1 · lane A\] Read $HOME/Downloads/t1.md" "$HOME/claude-args-A"
-wait_for "[ \"\$(tmux display-message -p -t parallel:A '#{pane_current_command}')\" = claude ]"
+wait_for "[ \"\$(tmux display-message -p -t parallel:1 '#{pane_current_command}')\" = claude ]"
 
+tmux copy-mode -t parallel:1   # as if someone scrolled lane A back in the wall
 printf 'A ruling.\n' >"$HOME/Downloads/r1.md"
 "$CCP" send A r1.md >/dev/null
-check "send types the checked line into the running session" wait_for "grep -q 'Read $HOME/Downloads/r1.md whole (sha256 starts' '$HOME/claude-input-A' 2>/dev/null"
+check "send types the checked line into the running session, even from copy mode" wait_for "grep -q 'Read $HOME/Downloads/r1.md whole (sha256 starts' '$HOME/claude-input-A' 2>/dev/null"
 
 printf 'r1.md deadbeef\n' >"$XDG_STATE_HOME/cc-parallel/relay/inbox/A-20260101T000000-relay.txt"
 check "a relay file with the wrong sha256 is rejected" wait_for "[ -f '$XDG_STATE_HOME/cc-parallel/relay/rejected/A-20260101T000000-relay.txt' ]"
@@ -70,9 +74,8 @@ check "--exit sends /exit to a busy lane, then launches" wait_for "grep -qx sonn
 check "the /exit reached the session" grep -qx /exit "$HOME/claude-input-A"
 
 sed -i "s|^# ON_CHANGE=.*|ON_CHANGE='echo \"\$LANE \$STATE\" >>\"\$HOME/changes\"'|" "$XDG_CONFIG_HOME/cc-parallel/config"
-tmux send-keys -t parallel:relay C-\\ ; sleep 1
 kill "$(cat "$XDG_STATE_HOME/cc-parallel/relay/log/relay.pid")" 2>/dev/null; sleep 1
-tmux send-keys -t parallel:relay "$CCP relay" Enter
+"$CCP" up >/dev/null
 wait_for "grep -q 'START relay' '$XDG_STATE_HOME/cc-parallel/relay/log/relay.log'"
 echo '{}' | CC_PARALLEL_LANE=B "$CCP" hook working; sleep 2
 echo '{}' | CC_PARALLEL_LANE=B "$CCP" hook idle
