@@ -72,6 +72,18 @@ printf '# T2 · second task\n' >"$HOME/Downloads/t2.md"
 "$CCP" queue A t2.md sonnet task --exit >/dev/null
 check "--exit sends /exit to a busy lane, then launches" wait_for "grep -qx sonnet '$HOME/claude-args-A' 2>/dev/null" 80
 check "the /exit reached the session" grep -qx /exit "$HOME/claude-input-A"
+check "the kickoff tells the agent how to mark its task done" grep -q "cc-parallel done T2" "$HOME/claude-args-A"
+
+printf '# T3 · follow-on\n' >"$HOME/Downloads/t3.md"
+"$CCP" queue A t3.md opus task --after-done >/dev/null
+sleep 4
+check "an --after-done launch waits while the lane has not run done" grep -qx sonnet "$HOME/claude-args-A"
+check "the relay logs why it is holding" grep -q "HOLD A-.*has not run cc-parallel done" "$XDG_STATE_HOME/cc-parallel/relay/log/relay.log"
+CC_PARALLEL_LANE=A CC_PARALLEL_STATUS="$XDG_STATE_HOME/cc-parallel/status" "$CCP" "done" T2 >/dev/null
+check "done lets the follow-on start: /exit, then the launch" wait_for "grep -q 'T3 · lane A' '$HOME/claude-args-A' 2>/dev/null" 80
+check "the done marker is used once" test ! -e "$XDG_STATE_HOME/cc-parallel/status/A.done"
+check "done outside a lane is refused" bash -c "! env -u CC_PARALLEL_LANE '$CCP' done 2>/dev/null"
+check "done --lane marks a lane started some other way" bash -c "'$CCP' done --lane B Q9 >/dev/null && grep -q '^Q9 ' '$XDG_STATE_HOME/cc-parallel/status/B.done'"
 
 sed -i "s|^# ON_CHANGE=.*|ON_CHANGE='echo \"\$LANE \$STATE\" >>\"\$HOME/changes\"'|" "$XDG_CONFIG_HOME/cc-parallel/config"
 kill "$(cat "$XDG_STATE_HOME/cc-parallel/relay/log/relay.pid")" 2>/dev/null; sleep 1
@@ -88,6 +100,20 @@ check "the wall tiles all six lanes" test "$(tmux -L parallel-wall-A_B_C_D_E_F l
 check "the wall refuses more lanes than fit" bash -c "WALL_MAX=4 CC_PARALLEL_NO_ATTACH=1 '$CCP' wall 2>&1 | grep -q 'too many'"
 CC_PARALLEL_NO_ATTACH=1 "$CCP" wall A C >/dev/null 2>&1
 check "a wall of a subset shows only those lanes" test "$(tmux -L parallel-wall-A_C list-panes -t wall:lanes | wc -l)" -eq 2
+
+# gc: old caches go; the current task's, a fresh one, the lane's own target/ and anything outside the globs stay.
+LB="$WORK/repo-lanes/b"; LC="$WORK/repo-lanes/c"
+mkdir -p "$LB/target/q1-scratch/clone/target/debug" "$LB/target/q2-scratch/clone/target/debug" "$LC/target/q3-scratch/clone/target/debug" "$LB/target/debug" "$LB/keepme/clone/target"
+touch -d '3 hours ago' "$LB/target/q1-scratch/clone/target/debug" "$LB/target/q1-scratch/clone/target" "$LB/target/q2-scratch/clone/target/debug" "$LB/target/q2-scratch/clone/target"
+echo 'Q2' >"$XDG_STATE_HOME/cc-parallel/status/B.code"
+printf 'GC_GLOBS="target/*-scratch/clone/target target"\n' >>"$XDG_CONFIG_HOME/cc-parallel/config"
+check "gc --dry-run lists without removing" bash -c "'$CCP' gc --dry-run | grep -q 'would remove .*q1-scratch' && [ -d '$LB/target/q1-scratch/clone/target' ]"
+"$CCP" gc >/dev/null
+check "gc removes an old cache of a finished task" test ! -e "$LB/target/q1-scratch/clone/target"
+check "gc keeps the lane's current task's cache" test -d "$LB/target/q2-scratch/clone/target"
+check "gc keeps a cache used in the last hour" test -d "$LC/target/q3-scratch/clone/target"
+check "gc never removes a lane's own target/" test -d "$LB/target/debug"
+check "gc touches nothing outside its globs" test -d "$LB/keepme/clone/target"
 
 check "nothing in the inbox was deleted: every file is in sent/ or rejected/" test "$(ls "$XDG_STATE_HOME/cc-parallel/relay/inbox"/*.txt 2>/dev/null | wc -l)" -eq 0
 

@@ -73,6 +73,15 @@ Or queue it, and the relay starts it when lane B is free:
 cc-parallel queue B fix-login-redirect.md opus task
 ```
 
+Queue the next task to start the moment the current one is finished, with no one at the keyboard:
+
+```
+cc-parallel queue B next-task.md opus sprint --after-done
+```
+
+The kickoff templates tell each agent to run `cc-parallel done` as its last action, but only when its task has fully
+landed. A lane that stops for a decision never runs it, so its follow-on waits for you.
+
 Hand a running lane a follow-up file (a review, a ruling, a correction):
 
 ```
@@ -99,6 +108,7 @@ change:
 | `CLAUDE_FLAGS` | empty | Extra flags for every launch. See "Permissions" below. |
 | `ON_CHANGE` | empty | For example `notify-send "lane $LANE is $STATE"`. |
 | `LANE_DIR_<X>` | — | Put one lane anywhere. |
+| `GC_GLOBS` | empty | Build caches the relay may remove, as globs under each lane, e.g. `target/*-scratch/clone/target`. It runs after a lane says done, and whenever free disk falls below `GC_MIN_FREE_GB` (100). It never touches a lane's current task, anything used in the last `GC_MIN_AGE_MIN` (60) minutes, or a lane's own `target/`. `cc-parallel gc --dry-run` shows what it would remove. |
 
 The kickoff templates are in `~/.config/cc-parallel/kickoff/*.txt`, with `{path}`, `{file}`, `{lane}` and `{code}`
 filled in. The code is the first word of the task file's `# ` title line, so `# T12 · Fix login` gives `T12`.

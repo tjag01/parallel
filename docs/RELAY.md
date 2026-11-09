@@ -38,6 +38,9 @@ The fields are the file, the model, the mode and the sha8, plus an optional `exi
 - With `exit`, a lane that is still running Claude Code gets `/exit` first, and the launch follows once the shell is
   back.
 - Without `exit`, the launch waits until the lane is free.
+- With `next` (`cc-parallel queue … --after-done`), the launch waits until the lane's current task runs
+  `cc-parallel done`. Then the relay consumes that marker, sends `/exit` and launches. Only one follow-on per lane is
+  armed at a time, and a lane that stopped for a ruling never says done, so nothing starts behind its back.
 
 ## The checks
 

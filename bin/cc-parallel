@@ -9,7 +9,7 @@
 # MIT licence. Requires bash 4+, tmux 3+, git, and Claude Code (`claude` on PATH).
 set -uo pipefail
 
-VERSION="0.1.3"
+VERSION="0.2.1"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 CONF="${CC_PARALLEL_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/cc-parallel/config}"
 CONF_DIR="$(dirname "$CONF")"
@@ -32,6 +32,9 @@ CC_PROCS="claude"                  # pane commands that mean "Claude Code is run
 RELAY_TEXT='Read {path} whole (sha256 starts {sha8}) and follow it.'
 ON_CHANGE=""                       # run when a lane turns idle or waiting; gets LANE, STATE, EVENT in its env
 POLL=10                            # relay poll, seconds
+GC_GLOBS=""                        # build caches the relay may remove, as globs under each lane dir, e.g. "target/*-scratch/clone/target"
+GC_MIN_FREE_GB=100                 # the relay collects when the lanes' disk has less free than this (and after any lane says done)
+GC_MIN_AGE_MIN=60                  # never remove a cache touched in the last N minutes
 WALL_MAX="${WALL_MAX:-9}"                         # lanes per wall before cc-parallel asks you to pick a subset
 
 # shellcheck source=/dev/null
@@ -116,16 +119,16 @@ EOF
 write_default_kickoffs() {
   local k="$CONF_DIR/kickoff"
   [ -f "$k/task.txt" ] || cat >"$k/task.txt" <<'EOF'
-[{code} · lane {lane}] Read {path} whole and carry it out in this directory. You are one of several agents working in parallel, each in its own git worktree: stay inside this worktree. If anything in the file contradicts what you find, or you are unsure, stop and report instead of improvising.
+[{code} · lane {lane}] Read {path} whole and carry it out in this directory. You are one of several agents working in parallel, each in its own git worktree: stay inside this worktree. If anything in the file contradicts what you find, or you are unsure, stop and report instead of improvising. When every step has landed and your final report is written, run {done} as your very last action, so the next queued task can start in this lane. Never run it if you stopped for a ruling or anything is unfinished.
 EOF
   [ -f "$k/sprint.txt" ] || cat >"$k/sprint.txt" <<'EOF'
-[{code} · lane {lane}] Execute the sprint file {path}. Run its verified-assumptions step first and stop on any STOP condition. Halt and report on any contradiction, unexpected result or ambiguity; never improvise past a stop. Commit and push after each step exactly as the file says. Read the report's deviations first when you write it. Do not propose or suggest next-sprint commands.
+[{code} · lane {lane}] Execute the sprint file {path}. Run its verified-assumptions step first and stop on any STOP condition. Halt and report on any contradiction, unexpected result or ambiguity; never improvise past a stop. Commit and push after each step exactly as the file says. Read the report's deviations first when you write it. Do not propose or suggest next-sprint commands. When every step has landed and your final report is written, run {done} as your very last action, so the next queued task can start in this lane. Never run it if you stopped for a ruling or anything is unfinished.
 EOF
   [ -f "$k/ground.txt" ] || cat >"$k/ground.txt" <<'EOF'
-[{code} · lane {lane} · read-only] Execute {path}. It is a read-only investigation: no edits, no commits, no builds unless it says so. Write exactly the one report file it names. Cite file:line for every claim; what you cannot cite goes under "Unverified".
+[{code} · lane {lane} · read-only] Execute {path}. It is a read-only investigation: no edits, no commits, no builds unless it says so. Write exactly the one report file it names. Cite file:line for every claim; what you cannot cite goes under "Unverified". When every step has landed and your final report is written, run {done} as your very last action, so the next queued task can start in this lane. Never run it if you stopped for a ruling or anything is unfinished.
 EOF
   [ -f "$k/resume.txt" ] || cat >"$k/resume.txt" <<'EOF'
-[{code} · lane {lane} · resume] You are resuming work in this lane in a fresh session. First read the sprint or task file this lane committed for {code} and its latest evidence, and run git status and git log -5. Then read {path} whole and follow it.
+[{code} · lane {lane} · resume] You are resuming work in this lane in a fresh session. First read the sprint or task file this lane committed for {code} and its latest evidence, and run git status and git log -5. Then read {path} whole and follow it. When every step has landed and your final report is written, run {done} as your very last action, so the next queued task can start in this lane. Never run it if you stopped for a ruling or anything is unfinished.
 EOF
 }
 
@@ -136,7 +139,11 @@ cmd_up() {
   need_repo
   command -v tmux >/dev/null || die "tmux is not installed"
   if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
-    tmux new-session -d -s "$SESSION" -n relay -c "$HOME"; echo "created session $SESSION"
+    relay_running || mkdir -p "$RELAY/log"
+    if relay_running; then tmux new-session -d -s "$SESSION" -n shell -c "$HOME"
+    else tmux new-session -d -s "$SESSION" -n relay -c "$HOME" "$(printf '%q' "$SELF") relay; exec \"\${SHELL:-bash}\""; fi
+    local w; for w in 1 2 3 4 5 6 7 8 9 10; do relay_running && break; sleep 0.3; done
+    echo "created session $SESSION"
   fi
   local l d
   for l in $LANES; do
@@ -146,12 +153,10 @@ cmd_up() {
   tmux set-option -t "=$SESSION:" history-limit 20000 >/dev/null
   if relay_running; then echo "relay already running"
   else
-    [ -n "$(win relay)" ] || tmux new-window -d -t "=$SESSION:" -n relay -c "$HOME"
-    if [ "$(tmux display-message -p -t "$(win relay)" '#{pane_current_command}')" = "${SHELL##*/}" ] || tmux display-message -p -t "$(win relay)" '#{pane_current_command}' | grep -qxE 'bash|zsh|sh|fish'; then
-      tmux send-keys -t "$(win relay)" C-u "$(printf '%q' "$SELF") relay" Enter; echo "relay started in window relay"
-    else
-      tmux new-window -d -t "=$SESSION:" -n relay "$(printf '%q' "$SELF") relay; exec \"\${SHELL:-bash}\""; echo "relay started in a new relay window (the old one was busy)"
-    fi
+    # The relay runs as its window's own command, never typed into a pane, so a busy pane cannot swallow it.
+    tmux new-window -d -t "=$SESSION:" -n relay "$(printf '%q' "$SELF") relay; exec \"\${SHELL:-bash}\""
+    local i; for i in 1 2 3 4 5 6 7 8 9 10; do relay_running && break; sleep 0.3; done
+    if relay_running; then echo "relay started (pid $(cat "$RELAY/log/relay.pid"))"; else echo "relay did not start; see: tmux attach -t $SESSION" >&2; fi
   fi
   echo "view: cc-parallel wall   ·   attach: tmux attach -t $SESSION"
 }
@@ -214,14 +219,17 @@ cmd_launch() {
   local prompt; prompt="$(<"$tpl")"
   prompt="${prompt//\{path\}/$path}"; prompt="${prompt//\{file\}/$file}"
   prompt="${prompt//\{lane\}/$lane}"; prompt="${prompt//\{code\}/$code}"
+  prompt="${prompt//\{done\}/$SELF done $code}"
   local q; q="$(printf '%q' "$SELF")"
   local settings
   settings=$(printf '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"%s hook working"}]}],"PreToolUse":[{"hooks":[{"type":"command","command":"%s hook working"}]}],"Notification":[{"hooks":[{"type":"command","command":"%s hook waiting"}]}],"Stop":[{"hooks":[{"type":"command","command":"%s hook idle"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"%s hook ended"}]}]}}' "$q" "$q" "$q" "$q" "$q")
   mkdir -p "$STATUS"
   printf 'starting %s launch %s %s\n' "$(date +%s)" "$code" "$mode" >"$STATUS/$lane"
+  [ -e "$STATUS/$lane.done" ] && mv -f -- "$STATUS/$lane.done" "$STATUS/$lane.done.prev"   # a new task starts undone
+  printf '%s\n' "$code" >"$STATUS/$lane.code"                                              # what gc must not touch
   echo "lane $lane · $dir · $code · $model · $mode"
   cd "$dir" || die "launch: cannot cd to $dir"
-  export CC_PARALLEL_LANE="$lane" CC_PARALLEL_STATUS="$STATUS"
+  export CC_PARALLEL_LANE="$lane" CC_PARALLEL_STATUS="$STATUS" CC_PARALLEL_BIN="$SELF"
   # shellcheck disable=SC2086
   exec "$CLAUDE_BIN" --model "$model" --settings "$settings" $CLAUDE_FLAGS "$prompt"
 }
@@ -240,6 +248,20 @@ cmd_hook() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
+# done: run by a lane's agent as its very last action, when its task has fully landed. A launch queued with
+# --after-done for that lane then starts (the relay sends /exit first). A lane that stopped never runs it.
+# ---------------------------------------------------------------------------------------------------------------
+cmd_done() {
+  local lane="${CC_PARALLEL_LANE:-}" dir="${CC_PARALLEL_STATUS:-$STATUS}" code=""
+  while [ $# -gt 0 ]; do case "$1" in --lane) lane="$2"; shift 2 ;; *) code="$1"; shift ;; esac; done
+  [ -n "$lane" ] || die "done: run it from inside a lane launched by cc-parallel, or name the lane with --lane"
+  is_lane "$lane" || die "done: no lane $lane"
+  mkdir -p "$dir"
+  printf '%s %s\n' "${code:--}" "$(date +%s)" >"$dir/.$lane.done.$$" && mv -f "$dir/.$lane.done.$$" "$dir/$lane.done"
+  echo "lane $lane marked done${code:+ ($code)}"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
 # status: one line per lane.
 # ---------------------------------------------------------------------------------------------------------------
 cmd_status() {
@@ -253,6 +275,7 @@ cmd_status() {
       if [ "$s" -lt 60 ]; then age="${s}s"; elif [ "$s" -lt 3600 ]; then age="$((s / 60))m"; else age="$((s / 3600))h"; fi
     fi
     cmd="$(tmux display-message -p -t "$(win "$l")" '#{pane_current_command}' 2>/dev/null || echo '-')"
+    [ -f "$STATUS/$l.done" ] && st="$st+done"
     printf '%-6s %-9s %-8s %-10s %s\n' "$l" "$st" "$age" "$cmd" "$(lane_dir "$l")"
   done
   relay_running && echo "relay: running (heartbeat $(cat "$RELAY/log/heartbeat" 2>/dev/null))" || echo "relay: not running (cc-parallel up starts it)"
@@ -261,8 +284,9 @@ cmd_status() {
 # ---------------------------------------------------------------------------------------------------------------
 # send / queue: how a supervisor talks to the relay. Each writes one checked file into the inbox.
 #   send  <lane> <file>                       type RELAY_TEXT for that file into the lane's running session
-#   queue <lane> <file> [model] [mode] [--exit]  launch the file in the lane once it is at a shell
-#                                               (--exit: send /exit to a lane still running Claude Code first)
+#   queue <lane> <file> [model] [mode] [--exit | --after-done]
+#         launch the file in the lane once it is at a shell. --exit: send /exit to a lane still running Claude
+#         Code first. --after-done: wait until the lane's current task runs `cc-parallel done`, then /exit and launch.
 # ---------------------------------------------------------------------------------------------------------------
 cmd_send() {
   local lane="${1:-}" file="${2:-}"; is_lane "$lane" && [ -f "$PROMPT_DIR/$file" ] || die "send: usage: cc-parallel send <lane> <file in $PROMPT_DIR>"
@@ -272,13 +296,14 @@ cmd_send() {
 }
 cmd_queue() {
   local lane="${1:-}" file="${2:-}" model="${3:-$DEFAULT_MODEL}" mode="${4:-$DEFAULT_MODE}" ex=""
-  local a; for a in "$@"; do [ "$a" = --exit ] && ex="exit"; done
-  [ "$model" = --exit ] && model="$DEFAULT_MODEL"; [ "$mode" = --exit ] && mode="$DEFAULT_MODE"
-  is_lane "$lane" && [ -f "$PROMPT_DIR/$file" ] || die "queue: usage: cc-parallel queue <lane> <file in $PROMPT_DIR> [model] [mode] [--exit]"
+  local a; for a in "$@"; do case "$a" in --exit) ex="exit" ;; --after-done) ex="next" ;; esac; done
+  case "$model" in --exit|--after-done) model="$DEFAULT_MODEL" ;; esac; case "$mode" in --exit|--after-done) mode="$DEFAULT_MODE" ;; esac
+  is_lane "$lane" && [ -f "$PROMPT_DIR/$file" ] || die "queue: usage: cc-parallel queue <lane> <file in $PROMPT_DIR> [model] [mode] [--exit | --after-done]"
   mkdir -p "$RELAY/inbox"
   printf '%s %s %s %s %s\n' "$file" "$model" "$mode" "$(sha8 "$PROMPT_DIR/$file")" "$ex" | sed 's/ *$//' \
     >"$RELAY/inbox/$lane-$(date -u +%Y%m%dT%H%M%S)-launch.txt"
-  echo "queued launch for lane $lane: $file ($model, $mode${ex:+, exit first})"
+  case "$ex" in exit) ex=", exit first" ;; next) ex=", after the lane's current task runs cc-parallel done" ;; esac
+  echo "queued launch for lane $lane: $file ($model, $mode$ex)"
 }
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -356,9 +381,16 @@ cmd_relay() {
     case " $MODELS " in *" $model "*) ;; *) reject "$f" "model must be one of: $MODELS"; return ;; esac
     [[ "$mode" =~ ^(task|sprint|ground|resume)$ ]] || { reject "$f" "bad mode"; return; }
     [[ "$s8" =~ ^[0-9a-f]{8}$ ]] && [ "$(sha8 "$PROMPT_DIR/$file")" = "$s8" ] || { reject "$f" "$file missing or its sha256 is not $s8"; return; }
-    { [ -z "$ex" ] || [ "$ex" = exit ]; } && [ -z "$extra" ] || { reject "$f" "5th field must be empty or exit"; return; }
+    { [ -z "$ex" ] || [ "$ex" = exit ] || [ "$ex" = next ]; } && [ -z "$extra" ] || { reject "$f" "5th field must be empty, exit or next"; return; }
+    if [ "$ex" = next ] && [ ! -e "$RELAY/inbox/.armed-$f" ]; then
+      # One armed follow-on per lane at a time, and only once the current task has said it is done.
+      compgen -G "$RELAY/inbox/.armed-$lane-*" >/dev/null && { log "HOLD $f: another follow-on for $lane is starting"; return; }
+      [ -e "$STATUS/$lane.done" ] || { log "HOLD $f: lane $lane has not run cc-parallel done"; return; }
+      mv -f -- "$STATUS/$lane.done" "$STATUS/$lane.done.used"; : >"$RELAY/inbox/.armed-$f"; log "DONE $lane: armed $f"
+      GC_DUE=1
+    fi
     if is_cc "$lane"; then
-      if [ "$ex" = exit ] && [ ! -e "$RELAY/inbox/.exit-sent-$f" ]; then
+      if { [ "$ex" = exit ] || [ "$ex" = next ]; } && [ ! -e "$RELAY/inbox/.exit-sent-$f" ]; then
         unmode "$(win "$lane")"; tmux send-keys -t "$(win "$lane")" C-u; type_line "$lane" "/exit"; : >"$RELAY/inbox/.exit-sent-$f"; log "EXIT sent to $lane for $f"
       fi
       log "HOLD $f: lane $lane still running Claude Code"; return
@@ -366,6 +398,8 @@ cmd_relay() {
     is_shell "$lane" || { log "HOLD $f: lane $lane is at '$(pane_cmd "$lane")'"; return; }
     type_line "$lane" "$(printf '%q' "$SELF") launch $lane $file $model $mode" && sent "$f" "launched $lane $file $model $mode"
     [ -e "$RELAY/inbox/.exit-sent-$f" ] && mv -f -- "$RELAY/inbox/.exit-sent-$f" "$RELAY/sent/.exit-sent-$f"
+    [ -e "$RELAY/inbox/.armed-$f" ] && mv -f -- "$RELAY/inbox/.armed-$f" "$RELAY/sent/.armed-$f"
+    return 0
   }
 
   if relay_running; then die "relay: already running (pid $(cat "$RELAY/log/relay.pid"))"; fi
@@ -379,11 +413,46 @@ cmd_relay() {
   while :; do
     [ $((n % 6)) -eq 0 ] && snapshot
     watch_states
+    if [ -n "$GC_GLOBS" ] && { [ "${GC_DUE:-0}" = 1 ] || { [ $((n % 30)) -eq 0 ] && [ "$(free_gb)" -lt "$GC_MIN_FREE_GB" ]; }; }; then
+      log "GC start (free $(free_gb) GB)"; cmd_gc 2>&1 | while IFS= read -r line; do log "$line"; done; log "GC end (free $(free_gb) GB)"; GC_DUE=0
+    fi
     for p in "$RELAY"/inbox/*.txt; do [ -e "$p" ] || continue; handle "$(basename -- "$p")"; done
     now >"$RELAY/log/heartbeat"
     n=$((n + 1)); sleep "$POLL"
   done
 }
+
+# ---------------------------------------------------------------------------------------------------------------
+# gc: remove old build caches (GC_GLOBS under each lane) so disks do not fill. Only directories that match a glob,
+# sit inside their lane, are not the lane's own top-level target/, are not the lane's current task (its code from
+# status/<lane>.code appears nowhere in the path), and were not touched for GC_MIN_AGE_MIN minutes. Everything else is
+# left. Each removal is logged with its size. --dry-run lists, removes nothing.
+# ---------------------------------------------------------------------------------------------------------------
+cmd_gc() {
+  local dry=0; [ "${1:-}" = --dry-run ] && dry=1
+  [ -n "$GC_GLOBS" ] || { echo "gc: GC_GLOBS is empty; nothing is collected (set it in $CONF)"; return 0; }
+  local l d g p real code sz n=0 freed=0
+  for l in $LANES; do
+    d="$(lane_dir "$l")"; [ -d "$d" ] || continue
+    d="$(readlink -f "$d")"
+    code=""; [ -f "$STATUS/$l.code" ] && code="$(tr -d '[:space:]' <"$STATUS/$l.code")"
+    for g in $GC_GLOBS; do
+      for p in "$d"/$g; do
+        [ -d "$p" ] && [ ! -L "$p" ] || continue
+        real="$(readlink -f "$p")"
+        case "$real" in "$d"/*) ;; *) echo "gc: skip $p (outside lane $l)"; continue ;; esac
+        [ "$real" = "$d/target" ] && { echo "gc: skip $p (the lane's own target)"; continue; }
+        if [ -n "$code" ] && printf '%s' "${real,,}" | grep -qF -- "${code,,}"; then echo "gc: keep $p (lane $l's current task $code)"; continue; fi
+        if [ -n "$(find "$p" -maxdepth 2 -newermt "$GC_MIN_AGE_MIN minutes ago" -print -quit 2>/dev/null)" ]; then echo "gc: keep $p (used in the last $GC_MIN_AGE_MIN min)"; continue; fi
+        sz="$(du -sk -- "$real" 2>/dev/null | cut -f1)"; sz="${sz:-0}"
+        if [ "$dry" = 1 ]; then echo "gc: would remove $p ($((sz / 1048576)) GB)"; n=$((n + 1)); freed=$((freed + sz)); continue; fi
+        if rm -rf -- "$real"; then echo "gc: removed $p ($((sz / 1048576)) GB)"; n=$((n + 1)); freed=$((freed + sz)); fi
+      done
+    done
+  done
+  echo "gc: $n cache(s), $((freed / 1048576)) GB$([ "$dry" = 1 ] && echo " (dry run)")"
+}
+free_gb() { df -Pk -- "$(lane_dir "$(first_lane)")" 2>/dev/null | awk 'NR==2 { print int($4 / 1048576) }'; }
 
 # ---------------------------------------------------------------------------------------------------------------
 cmd_install_app() {
@@ -413,8 +482,11 @@ cc-parallel $VERSION: several Claude Code agents in parallel, one per git worktr
   cc-parallel launch LANE FILE [MODEL] [MODE]   start Claude Code in a lane on a file from PROMPT_DIR
   cc-parallel status                     each lane's state (working, waiting, idle, ended) and the relay
   cc-parallel send LANE FILE             relay: type "read FILE and follow it" into a lane's running session
-  cc-parallel queue LANE FILE [MODEL] [MODE] [--exit]   relay: launch FILE in a lane once it is free
+  cc-parallel queue LANE FILE [MODEL] [MODE] [--exit|--after-done]   relay: launch FILE in a lane once it is free
+                                         (--after-done: once the lane's current task runs "cc-parallel done")
+  cc-parallel done [CODE] [--lane L]     run by a lane's agent when its task has fully landed
   cc-parallel relay                      the watcher (cc-parallel up runs it in the relay window)
+  cc-parallel gc [--dry-run]             remove old build caches named by GC_GLOBS (the relay also runs it when disk is low)
   cc-parallel install-app                a desktop launcher that opens the wall
 
 Config: $CONF
@@ -431,6 +503,8 @@ case "$sub" in
   launch) cmd_launch "$@" ;;
   hook) cmd_hook "$@" ;;
   status) cmd_status "$@" ;;
+  done) cmd_done "$@" ;;
+  gc) cmd_gc "$@" ;;
   send) cmd_send "$@" ;;
   queue) cmd_queue "$@" ;;
   relay) cmd_relay "$@" ;;
