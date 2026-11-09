@@ -9,7 +9,7 @@
 # MIT licence. Requires bash 4+, tmux 3+, git, and Claude Code (`claude` on PATH).
 set -uo pipefail
 
-VERSION="0.1.2"
+VERSION="0.1.3"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 CONF="${CC_PARALLEL_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/cc-parallel/config}"
 CONF_DIR="$(dirname "$CONF")"
@@ -143,14 +143,14 @@ cmd_up() {
     d="$(lane_dir "$l")"; [ -d "$d" ] || { echo "lane $l: $d does not exist (run cc-parallel init)" >&2; continue; }
     [ -n "$(win "$l")" ] || { tmux new-window -d -t "$SESSION" -n "$l" -c "$d"; echo "created window $l"; }
   done
-  tmux set-option -t "=$SESSION" history-limit 20000 >/dev/null
+  tmux set-option -t "=$SESSION:" history-limit 20000 >/dev/null
   if relay_running; then echo "relay already running"
   else
-    [ -n "$(win relay)" ] || tmux new-window -d -t "=$SESSION" -n relay -c "$HOME"
+    [ -n "$(win relay)" ] || tmux new-window -d -t "=$SESSION:" -n relay -c "$HOME"
     if [ "$(tmux display-message -p -t "$(win relay)" '#{pane_current_command}')" = "${SHELL##*/}" ] || tmux display-message -p -t "$(win relay)" '#{pane_current_command}' | grep -qxE 'bash|zsh|sh|fish'; then
       tmux send-keys -t "$(win relay)" C-u "$(printf '%q' "$SELF") relay" Enter; echo "relay started in window relay"
     else
-      tmux new-window -d -t "=$SESSION" -n relay "$(printf '%q' "$SELF") relay; exec \"\${SHELL:-bash}\""; echo "relay started in a new relay window (the old one was busy)"
+      tmux new-window -d -t "=$SESSION:" -n relay "$(printf '%q' "$SELF") relay; exec \"\${SHELL:-bash}\""; echo "relay started in a new relay window (the old one was busy)"
     fi
   fi
   echo "view: cc-parallel wall   ·   attach: tmux attach -t $SESSION"
