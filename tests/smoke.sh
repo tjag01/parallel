@@ -27,7 +27,13 @@ cat >"$WORK/bin/claude" <<'EOF'
 printf '%s\n' "$@" >"$HOME/claude-args-$CC_PARALLEL_LANE"
 while IFS= read -r line; do
   printf '%s\n' "$line" >>"$HOME/claude-input-$CC_PARALLEL_LANE"
-  [ "$line" = "/exit" ] && exit 0
+  if [ "$line" = "/exit" ]; then
+    if [ -e "$HOME/dialog-$CC_PARALLEL_LANE" ]; then   # as Claude Code does when background work is still running
+      printf 'Background work is running\n  1. Exit and stop tasks\n  2. Move to background and exit\n  3. Stay\n Enter to confirm\n'
+      while IFS= read -r -n1 c; do printf 'dialog-key %s\n' "$c" >>"$HOME/claude-input-$CC_PARALLEL_LANE"; [ "$c" = 1 ] && exit 0; done
+    fi
+    exit 0
+  fi
 done
 EOF
 chmod +x "$WORK/bin/claude"
@@ -82,6 +88,12 @@ check "the relay logs why it is holding" grep -q "HOLD A-.*has not run cc-parall
 check "the relay logs a hold once, not on every poll" test "$(grep -c "HOLD A-.*has not run cc-parallel done" "$XDG_STATE_HOME/cc-parallel/relay/log/relay.log")" -eq 1
 CC_PARALLEL_LANE=A CC_PARALLEL_STATUS="$XDG_STATE_HOME/cc-parallel/status" "$CCP" "done" T2 >/dev/null
 check "done lets the follow-on start: /exit, then the launch" wait_for "grep -q 'T3 · lane A' '$HOME/claude-args-A' 2>/dev/null" 80
+touch "$HOME/dialog-A"
+printf '# T4 · after a dialog\n' >"$HOME/Downloads/t4.md"
+"$CCP" queue A t4.md opus task --exit >/dev/null
+check "the relay answers Claude Code's exit dialog with 1, then launches" wait_for "grep -q 'T4 · lane A' '$HOME/claude-args-A' 2>/dev/null" 80
+check "the dialog got exactly the key 1" grep -qx 'dialog-key 1' "$HOME/claude-input-A"
+rm -f "$HOME/dialog-A"
 check "the done marker is used once" test ! -e "$XDG_STATE_HOME/cc-parallel/status/A.done"
 check "done outside a lane is refused" bash -c "! env -u CC_PARALLEL_LANE '$CCP' done 2>/dev/null"
 check "done --lane marks a lane started some other way" bash -c "'$CCP' done --lane B Q9 >/dev/null && grep -q '^Q9 ' '$XDG_STATE_HOME/cc-parallel/status/B.done'"

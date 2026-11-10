@@ -9,7 +9,7 @@
 # MIT licence. Requires bash 4+, tmux 3+, git, and Claude Code (`claude` on PATH).
 set -uo pipefail
 
-VERSION="0.2.2"
+VERSION="0.2.3"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 CONF="${CC_PARALLEL_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/cc-parallel/config}"
 CONF_DIR="$(dirname "$CONF")"
@@ -325,6 +325,9 @@ cmd_relay() {
   hold() { [ "${HELD[$1]:-}" = "$2" ] && return; HELD[$1]="$2"; log "HOLD $1: $2"; }  # once per file and reason, not every poll
   unmode() { # a pane in copy mode (scrolled back in the wall) would read typed keys as scroll commands; leave it first
     local w="$1"; [ "$(tmux display-message -p -t "$w" '#{pane_in_mode}' 2>/dev/null)" = 1 ] && tmux send-keys -t "$w" -X cancel && log "COPY-MODE left in $w before typing"; return 0; }
+  exit_dialog() { local w; w="$(win "$1")" || return 1
+    tmux capture-pane -p -t "$w" -S -15 2>/dev/null | grep -q 'Exit and stop tasks' &&
+      tmux capture-pane -p -t "$w" -S -15 2>/dev/null | grep -q 'Enter to confirm'; }
   type_line() { local w; w="$(win "$1")" || return 1; unmode "$w"; tmux send-keys -t "$w" -l -- "$2" && sleep 0.7 && tmux send-keys -t "$w" Enter; }
 
   snapshot() {
@@ -394,6 +397,11 @@ cmd_relay() {
     if is_cc "$lane"; then
       if { [ "$ex" = exit ] || [ "$ex" = next ]; } && [ ! -e "$RELAY/inbox/.exit-sent-$f" ]; then
         unmode "$(win "$lane")"; tmux send-keys -t "$(win "$lane")" C-u; type_line "$lane" "/exit"; : >"$RELAY/inbox/.exit-sent-$f"; log "EXIT sent to $lane for $f"
+      elif [ -e "$RELAY/inbox/.exit-sent-$f" ] && exit_dialog "$lane"; then
+        # Claude Code asks before exiting when background work (a shell, a scheduled wake-up) is still running.
+        # The lane has run `done` (or was told to exit), so its background work is finished business: choose
+        # "1. Exit and stop tasks". Only this exact dialog is answered, and only after our own /exit.
+        tmux send-keys -t "$(win "$lane")" 1 && hold "$f" "answered the exit dialog in $lane (exit and stop tasks)"
       fi
       hold "$f" "lane $lane still running Claude Code"; return
     fi
