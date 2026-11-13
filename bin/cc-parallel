@@ -35,8 +35,12 @@ POLL=10                            # relay poll, seconds
 GC_GLOBS=""                        # build caches the relay may remove, as globs under each lane dir, e.g. "target/*-scratch/clone/target"
 GC_MIN_FREE_GB=100                 # the relay collects when the lanes' disk has less free than this (and after any lane says done)
 GC_MIN_AGE_MIN=60                  # never remove a cache touched in the last N minutes
-MODEL_LABEL_opus="Opus 5.5"         # how the status line names each model (MODEL_LABEL_<model>; unset = the model name)
+# How the status line names each model: MODEL_LABEL_<model>, read indirectly by label_model (unset = the model name).
+# shellcheck disable=SC2034
+MODEL_LABEL_opus="Opus 5.5"
+# shellcheck disable=SC2034
 MODEL_LABEL_fable="Fable 5.2"
+# shellcheck disable=SC2034
 MODEL_LABEL_sonnet="Sonnet"
 STOP_GLOB="target/*-scratch/drafts/STOP_QUESTIONS.md"   # a lane is "stopped" (red) when such a file, under its dir, is newer than its last launch or relay
 WALL_MAX="${WALL_MAX:-9}"                         # lanes per wall before cc-parallel asks you to pick a subset
