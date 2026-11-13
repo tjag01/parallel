@@ -9,7 +9,7 @@
 # MIT licence. Requires bash 4+, tmux 3+, git, and Claude Code (`claude` on PATH).
 set -uo pipefail
 
-VERSION="0.2.3"
+VERSION="0.2.5"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 CONF="${CC_PARALLEL_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/cc-parallel/config}"
 CONF_DIR="$(dirname "$CONF")"
@@ -35,6 +35,10 @@ POLL=10                            # relay poll, seconds
 GC_GLOBS=""                        # build caches the relay may remove, as globs under each lane dir, e.g. "target/*-scratch/clone/target"
 GC_MIN_FREE_GB=100                 # the relay collects when the lanes' disk has less free than this (and after any lane says done)
 GC_MIN_AGE_MIN=60                  # never remove a cache touched in the last N minutes
+MODEL_LABEL_opus="Opus 5.5"         # how the status line names each model (MODEL_LABEL_<model>; unset = the model name)
+MODEL_LABEL_fable="Fable 5.2"
+MODEL_LABEL_sonnet="Sonnet"
+STOP_GLOB="target/*-scratch/drafts/STOP_QUESTIONS.md"   # a lane is "stopped" (red) when such a file, under its dir, is newer than its last launch or relay
 WALL_MAX="${WALL_MAX:-9}"                         # lanes per wall before cc-parallel asks you to pick a subset
 
 # shellcheck source=/dev/null
@@ -158,7 +162,66 @@ cmd_up() {
     local i; for i in 1 2 3 4 5 6 7 8 9 10; do relay_running && break; sleep 0.3; done
     if relay_running; then echo "relay started (pid $(cat "$RELAY/log/relay.pid"))"; else echo "relay did not start; see: tmux attach -t $SESSION" >&2; fi
   fi
+  cmd_statusbar >/dev/null 2>&1
   echo "view: cc-parallel wall   ·   attach: tmux attach -t $SESSION"
+}
+# statusbar: each lane's tmux status line shows only: lane · model · sprint · time and date.
+label_model() { local v="MODEL_LABEL_$1"; printf '%s' "${!v:-$1}"; }
+sprint_name() { # task file -> "Q391 AND-DEVICE-1" (its first heading up to the colon, without "Sprint"/"·")
+  local t; t="$(sed -n '1{s/^# *//;s/:.*//;s/ *· */ /g;s/ Sprint / /;s/ Grounding / /;s/#//g;p;}' -- "$1" 2>/dev/null)"
+  [ -n "$t" ] || t="$(basename -- "$1" .md)"; printf '%.48s' "$t"; }
+# bar: one lane's status-line segment, coloured by state (green working, amber waiting, red stopped for a ruling).
+lane_stopped() { # lane -> 0 when a STOP file is newer than the lane's last launch or relay
+  [ -n "$STOP_GLOB" ] || return 1
+  local d ref=0 f m; d="$(lane_dir "$1")"
+  [ -f "$STATUS/$1.code" ] && ref="$(stat -c %Y -- "$STATUS/$1.code" 2>/dev/null || echo 0)"
+  for f in "$RELAY/sent/$1"-*; do [ -e "$f" ] || continue; m="$(stat -c %Y -- "$f" 2>/dev/null || echo 0)"; [ "$m" -gt "$ref" ] && ref="$m"; done
+  for f in $d/$STOP_GLOB; do [ -e "$f" ] || continue; m="$(stat -c %Y -- "$f" 2>/dev/null || echo 0)"; [ "$m" -gt "$ref" ] && return 0; done
+  return 1
+}
+cmd_bar() {
+  local l="${1:-}" st="" lab="-" since el="" now style word=""
+  is_lane "$l" || { printf ' %s ' "$l"; return 0; }
+  [ -f "$STATUS/$l" ] && read -r st _ <"$STATUS/$l"
+  [ -f "$STATUS/$l.label" ] && lab="$(<"$STATUS/$l.label")"
+  now="$(date +%s)"
+  if [ -f "$STATUS/$l.code" ]; then
+    since="$(stat -c %Y -- "$STATUS/$l.code" 2>/dev/null || echo "$now")"; el=$(( (now - since) / 60 ))
+    el="$(( el / 60 ))h$(printf '%02d' $(( el % 60 )))m"
+  fi
+  case "$st" in
+    working) style="bg=colour34,fg=black" ;;
+    waiting|idle|starting) style="bg=colour214,fg=black" ;;
+    *) style="bg=colour244,fg=black" ;;
+  esac
+  if [ -f "$STATUS/$l.done" ]; then style="bg=colour33,fg=black"; word=" · done"
+  elif [ "$st" != working ] && lane_stopped "$l"; then style="bg=colour196,fg=white,bold"; word=" · STOP"; fi
+  printf '#[%s] %s · %s · %s%s #[default]' "$style" "$l" "${lab//#/}" "${el:--}" "$word"
+}
+cmd_statusbar() {
+  tmux has-session -t "=$SESSION" 2>/dev/null || die "statusbar: no session $SESSION (run cc-parallel up)"
+  local s l w lab q; q="$(printf '%q' "$SELF")"
+  while read -r s; do
+    case "$s" in "$SESSION"|"$SESSION"-view-*) ;; *) continue ;; esac
+    tmux set-option -t "=$s:" status-style "bg=colour236,fg=colour250" >/dev/null
+    tmux set-option -t "=$s:" status-left-length 120 >/dev/null
+    tmux set-option -t "=$s:" status-left "#($q bar #{window_name})" >/dev/null
+    tmux set-option -t "=$s:" status-right ' %H:%M %d-%b-%y ' >/dev/null
+    tmux set-option -t "=$s:" status-interval 10 >/dev/null
+  done < <(tmux list-sessions -F '#{session_name}')
+  for l in $LANES relay; do
+    w="$(win "$l")"; [ -n "$w" ] || continue
+    tmux set-option -w -t "$w" window-status-format "" >/dev/null
+    tmux set-option -w -t "$w" window-status-current-format "" >/dev/null
+    lab=""; [ -f "$STATUS/$l.label" ] && lab="$(<"$STATUS/$l.label")"
+    [ -n "$lab" ] && tmux set-option -w -t "$w" @cc_label "$lab" >/dev/null
+  done
+  local sock; for sock in "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${SESSION}-wall-"*; do   # walls already open: just the time
+    [ -S "$sock" ] || continue
+    tmux -S "$sock" set-option -g status-left "" >/dev/null 2>&1
+    tmux -S "$sock" set-option -g status-right " %H:%M %d-%b-%y " >/dev/null 2>&1
+  done
+  return 0
 }
 relay_running() { [ -f "$RELAY/log/relay.pid" ] && kill -0 "$(cat "$RELAY/log/relay.pid")" 2>/dev/null; }
 
@@ -179,12 +242,13 @@ cmd_wall() {
     tmux has-session -t "${SESSION}-view-$l" 2>/dev/null || tmux new-session -d -t "$SESSION" -s "${SESSION}-view-$l"
     tmux select-window -t "${SESSION}-view-$l:$l"
   done
+  cmd_statusbar >/dev/null 2>&1
   if ! "${W[@]}" has-session -t wall 2>/dev/null; then
     "${W[@]}" -f /dev/null new-session -d -s wall -n lanes -x 240 -y 60 "env -u TMUX tmux attach -t ${SESSION}-view-${sel[0]}"
     "${W[@]}" set-option -g prefix C-a; "${W[@]}" unbind-key C-b; "${W[@]}" bind-key C-a send-prefix
     "${W[@]}" set-option -g mouse on
-    "${W[@]}" set-option -g status-left "parallel · ${sel[*]}  "
-    "${W[@]}" set-option -g status-right "click to focus · Ctrl-a z zoom · Ctrl-a d close"
+    "${W[@]}" set-option -g status-left ""
+    "${W[@]}" set-option -g status-right " %H:%M %d-%b-%y "
     "${W[@]}" set-option -g pane-border-status top
     "${W[@]}" set-option -g pane-border-format ' lane #{pane_title} '
     "${W[@]}" select-pane -t wall:lanes.0 -T "${sel[0]}"
@@ -227,6 +291,8 @@ cmd_launch() {
   printf 'starting %s launch %s %s\n' "$(date +%s)" "$code" "$mode" >"$STATUS/$lane"
   [ -e "$STATUS/$lane.done" ] && mv -f -- "$STATUS/$lane.done" "$STATUS/$lane.done.prev"   # a new task starts undone
   printf '%s\n' "$code" >"$STATUS/$lane.code"                                              # what gc must not touch
+  printf '%s · %s\n' "$(label_model "$model")" "$(sprint_name "$path")" >"$STATUS/$lane.label"  # the status line's
+  { local w; w="$(win "$lane")"; [ -n "$w" ] && tmux set-option -w -t "$w" @cc_label "$(<"$STATUS/$lane.label")"; } >/dev/null 2>&1
   echo "lane $lane · $dir · $code · $model · $mode"
   cd "$dir" || die "launch: cannot cd to $dir"
   export CC_PARALLEL_LANE="$lane" CC_PARALLEL_STATUS="$STATUS" CC_PARALLEL_BIN="$SELF"
@@ -498,6 +564,7 @@ cc-parallel $VERSION: several Claude Code agents in parallel, one per git worktr
   cc-parallel relay                      the watcher (cc-parallel up runs it in the relay window)
   cc-parallel gc [--dry-run]             remove old build caches named by GC_GLOBS (the relay also runs it when disk is low)
   cc-parallel install-app                a desktop launcher that opens the wall
+  cc-parallel statusbar                  each lane's status line: lane · model · sprint · time on it, coloured by state; then the time (up and wall run it)
 
 Config: $CONF
 State:  $STATE_DIR
@@ -519,6 +586,8 @@ case "$sub" in
   queue) cmd_queue "$@" ;;
   relay) cmd_relay "$@" ;;
   install-app) cmd_install_app "$@" ;;
+  statusbar) cmd_statusbar "$@" ;;
+  bar) cmd_bar "$@" ;;
   version|--version) echo "cc-parallel $VERSION" ;;
   help|-h|--help) cmd_help ;;
   *) die "unknown command $sub (cc-parallel help)" ;;

@@ -28,6 +28,9 @@ One bash script (`cc-parallel`), tmux and git. No daemon, no account, no network
   settings files. Each lane reports `working`, `waiting` (Claude Code needs you), `idle` (its turn is over) or
   `ended`.
   - `cc-parallel status` shows all lanes at a glance.
+  - Each lane's tmux status line shows only the lane, its model, its sprint and how long it has run, coloured green
+    while working, amber while waiting and red with `STOP` when the lane has written a stop file (`STOP_GLOB`) since
+    its last launch or relay. `cc-parallel statusbar` applies it to open windows and walls; `up` and `wall` run it.
   - `ON_CHANGE` runs a command whenever a lane turns idle or waiting, for example a desktop notification.
 - **The relay:** a watcher that reads one-line files from an inbox and either types a fixed, checked sentence into a
   lane's running session ("Read <file> whole (sha256 starts …) and follow it.") or launches a task in a free lane.

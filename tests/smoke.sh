@@ -128,6 +128,22 @@ check "gc keeps a cache used in the last hour" test -d "$LC/target/q3-scratch/cl
 check "gc never removes a lane's own target/" test -d "$LB/target/debug"
 check "gc touches nothing outside its globs" test -d "$LB/keepme/clone/target"
 
+# The status line: lane · model · sprint · time on it, coloured by state; STOP when a lane's stop file is newer than its last launch or relay.
+SD="$XDG_STATE_HOME/cc-parallel/status"
+printf 'Opus · Q2 Two\n' >"$SD/B.label"; printf 'working 0 hook\n' >"$SD/B"
+[ -e "$SD/B.done" ] && { check "bar: a lane that ran done is blue, with done" bash -c "'$CCP' bar B | grep -q 'bg=colour33.* · done '"; mv "$SD/B.done" "$SD/B.done.used"; }
+check "bar: a working lane is green and shows lane, label and time" bash -c "'$CCP' bar B | grep -q '^#\[bg=colour34,fg=black\] B · Opus · Q2 Two · 0h0[0-9]m #\[default\]\$'"
+printf 'waiting 0 hook\n' >"$SD/B"
+check "bar: a waiting lane is amber" bash -c "'$CCP' bar B | grep -q 'bg=colour214'"
+mkdir -p "$LB/target/q2-scratch/drafts"; touch -d '+1 min' "$LB/target/q2-scratch/drafts/STOP_QUESTIONS.md"
+check "bar: a stop file newer than the launch makes the lane red, with STOP" bash -c "'$CCP' bar B | grep -q 'bg=colour196.* · STOP '"
+touch -d '1 day ago' "$LB/target/q2-scratch/drafts/STOP_QUESTIONS.md"
+check "bar: an older stop file does not" bash -c "! '$CCP' bar B | grep -q STOP"
+"$CCP" statusbar >/dev/null 2>&1
+check "statusbar: the lanes' status line runs cc-parallel bar" bash -c "tmux show -t parallel -v status-left | grep -q 'bar #{window_name}'"
+check "statusbar: the window list is hidden" test -z "$(tmux show -w -t parallel:B -v window-status-format 2>/dev/null)"
+check "statusbar: an open wall shows only the time" test "$(tmux -L parallel-wall-A_C show -gv status-right)" = " %H:%M %d-%b-%y "
+
 check "nothing in the inbox was deleted: every file is in sent/ or rejected/" test "$(ls "$XDG_STATE_HOME/cc-parallel/relay/inbox"/*.txt 2>/dev/null | wc -l)" -eq 0
 
 echo; echo "$pass passed, $fail failed"
