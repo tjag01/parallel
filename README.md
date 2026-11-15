@@ -121,6 +121,7 @@ change:
 | `PROMPT_DIR` | `~/Downloads` | Where task and follow-up files are read from. |
 | `MODELS`, `DEFAULT_MODEL` | `opus sonnet`, `opus` | What a launch may name. |
 | `CLAUDE_FLAGS` | empty | Extra flags for every launch. See "Permissions" below. |
+| `LAUNCH_SETTINGS_EXTRA` | empty | JSON object members, without the braces, put first in the `--settings` each launch passes, e.g. `'"enabledPlugins":{"some-plugin@marketplace":false}'` to turn a plugin off for lanes only. Empty: the settings are only the hooks. |
 | `ON_CHANGE` | empty | For example `notify-send "lane $LANE is $STATE"`. |
 | `LANE_DIR_<X>` | — | Put one lane anywhere. |
 | `GC_GLOBS` | empty | Build caches the relay may remove, as globs under each lane, e.g. `target/*-scratch/clone/target`. It runs after a lane says done, and whenever free disk falls below `GC_MIN_FREE_GB` (100). It never touches a lane's current task, anything used in the last `GC_MIN_AGE_MIN` (60) minutes, or a lane's own `target/`. `cc-parallel gc --dry-run` shows what it would remove. |

@@ -37,6 +37,10 @@ The fields are the file, the model, the mode and the sha8, plus an optional `exi
 - When the lane is at a shell, the relay types `cc-parallel launch <lane> <file> <model> <mode>`.
 - With `exit`, a lane that is still running Claude Code gets `/exit` first, and the launch follows once the shell is
   back.
+- If Claude Code answers the `/exit` with a question, the relay answers only two, each by its exact words: the
+  background-work dialog ("1. Exit and stop tasks", answered `1`), and the unsent-feedback-draft prompt ("Esc to
+  discard and exit", answered Esc, never Enter, which would send the draft). The feedback prompt is checked before
+  `/exit` is typed, and a relay line is held, not typed, while a lane shows it.
 - Without `exit`, the launch waits until the lane is free.
 - With `next` (`cc-parallel queue … --after-done`), the launch waits until the lane's current task runs
   `cc-parallel done`. Then the relay consumes that marker, sends `/exit` and launches. Only one follow-on per lane is

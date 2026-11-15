@@ -9,7 +9,7 @@
 # MIT licence. Requires bash 4+, tmux 3+, git, and Claude Code (`claude` on PATH).
 set -uo pipefail
 
-VERSION="0.2.5"
+VERSION="0.2.6"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 CONF="${CC_PARALLEL_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/cc-parallel/config}"
 CONF_DIR="$(dirname "$CONF")"
@@ -27,6 +27,7 @@ DEFAULT_MODEL="opus"
 DEFAULT_MODE="task"                # task | sprint | ground | resume (templates in $CONF_DIR/kickoff/)
 CLAUDE_BIN="claude"                # the Claude Code command
 CLAUDE_FLAGS=""                    # extra flags for every launch, e.g. "--dangerously-skip-permissions" (read the README first)
+LAUNCH_SETTINGS_EXTRA=""           # JSON object members (no braces) put first in every launch's --settings, e.g. '"enabledPlugins":{"x@y":false}'
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cc-parallel"
 CC_PROCS="claude"                  # pane commands that mean "Claude Code is running in this lane"
 RELAY_TEXT='Read {path} whole (sha256 starts {sha8}) and follow it.'
@@ -291,6 +292,7 @@ cmd_launch() {
   local q; q="$(printf '%q' "$SELF")"
   local settings
   settings=$(printf '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"%s hook working"}]}],"PreToolUse":[{"hooks":[{"type":"command","command":"%s hook working"}]}],"Notification":[{"hooks":[{"type":"command","command":"%s hook waiting"}]}],"Stop":[{"hooks":[{"type":"command","command":"%s hook idle"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"%s hook ended"}]}]}}' "$q" "$q" "$q" "$q" "$q")
+  [ -z "$LAUNCH_SETTINGS_EXTRA" ] || settings="{$LAUNCH_SETTINGS_EXTRA,${settings:1}"   # the config's members first
   mkdir -p "$STATUS"
   printf 'starting %s launch %s %s\n' "$(date +%s)" "$code" "$mode" >"$STATUS/$lane"
   [ -e "$STATUS/$lane.done" ] && mv -f -- "$STATUS/$lane.done" "$STATUS/$lane.done.prev"   # a new task starts undone
@@ -398,6 +400,9 @@ cmd_relay() {
   exit_dialog() { local w; w="$(win "$1")" || return 1
     tmux capture-pane -p -t "$w" -S -15 2>/dev/null | grep -q 'Exit and stop tasks' &&
       tmux capture-pane -p -t "$w" -S -15 2>/dev/null | grep -q 'Enter to confirm'; }
+  feedback_prompt() { local w; w="$(win "$1")" || return 1   # Claude Code's exit-time question about an unsent feedback draft
+    tmux capture-pane -p -t "$w" -S -15 2>/dev/null | grep -q 'unsent feedback draft' &&
+      tmux capture-pane -p -t "$w" -S -15 2>/dev/null | grep -q 'Esc to discard and exit'; }
   type_line() { local w; w="$(win "$1")" || return 1; unmode "$w"; tmux send-keys -t "$w" -l -- "$2" && sleep 0.7 && tmux send-keys -t "$w" Enter; }
 
   snapshot() {
@@ -444,6 +449,7 @@ cmd_relay() {
       [[ "$file" =~ ^[A-Za-z0-9_.-]+$ ]] && [[ "$s8" =~ ^[0-9a-f]{8}$ ]] && [ -z "$extra" ] || { reject "$f" "want: <file> <sha8>"; return; }
       [ "$(sha8 "$PROMPT_DIR/$file")" = "$s8" ] || { reject "$f" "$file missing or its sha256 is not $s8"; return; }
       is_cc "$lane" || { hold "$f" "lane $lane is at '$(pane_cmd "$lane")', not Claude Code"; return; }
+      feedback_prompt "$lane" && { hold "$f" "lane $lane is at Claude Code's feedback-draft prompt: not typed (Enter there would send the draft)"; return; }
       local text="$RELAY_TEXT"; text="${text//\{path\}/$PROMPT_DIR/$file}"; text="${text//\{file\}/$file}"; text="${text//\{sha8\}/$s8}"
       unmode "$(win "$lane")"; tmux send-keys -t "$(win "$lane")" C-u
       type_line "$lane" "$text" && sent "$f" "typed into $lane ($file $s8)"
@@ -465,7 +471,12 @@ cmd_relay() {
       GC_DUE=1
     fi
     if is_cc "$lane"; then
-      if { [ "$ex" = exit ] || [ "$ex" = next ]; } && [ ! -e "$RELAY/inbox/.exit-sent-$f" ]; then
+      if { [ "$ex" = exit ] || [ "$ex" = next ]; } && feedback_prompt "$lane"; then
+        # On exit Claude Code may ask about a feedback draft it holds ("Enter to review & send · Esc to discard and
+        # exit"). This launch replaces the session, so answer Esc: discard the draft and exit. Never Enter, which would
+        # send it. Checked before /exit is typed, because a typed line at this prompt ends in Enter.
+        tmux send-keys -t "$(win "$lane")" Escape && hold "$f" "answered the feedback-draft prompt in $lane (Esc: discard and exit)"
+      elif { [ "$ex" = exit ] || [ "$ex" = next ]; } && [ ! -e "$RELAY/inbox/.exit-sent-$f" ]; then
         unmode "$(win "$lane")"; tmux send-keys -t "$(win "$lane")" C-u; type_line "$lane" "/exit"; : >"$RELAY/inbox/.exit-sent-$f"; log "EXIT sent to $lane for $f"
       elif [ -e "$RELAY/inbox/.exit-sent-$f" ] && exit_dialog "$lane"; then
         # Claude Code asks before exiting when background work (a shell, a scheduled wake-up) is still running.

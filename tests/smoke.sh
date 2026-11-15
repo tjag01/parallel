@@ -32,6 +32,13 @@ while IFS= read -r line; do
       printf 'Background work is running\n  1. Exit and stop tasks\n  2. Move to background and exit\n  3. Stay\n Enter to confirm\n'
       while IFS= read -r -n1 c; do printf 'dialog-key %s\n' "$c" >>"$HOME/claude-input-$CC_PARALLEL_LANE"; [ "$c" = 1 ] && exit 0; done
     fi
+    if [ -e "$HOME/feedback-$CC_PARALLEL_LANE" ]; then   # as Claude Code does when it holds an unsent feedback draft
+      printf 'You have 1 unsent feedback draft\n  Enter to review & send · Esc to discard and exit\n'
+      while IFS= read -r -n1 c; do
+        if [ "$c" = $'\e' ]; then printf 'feedback-key ESC\n' >>"$HOME/claude-input-$CC_PARALLEL_LANE"; exit 0; fi
+        if [ -z "$c" ]; then printf 'feedback-key ENTER\n' >>"$HOME/claude-input-$CC_PARALLEL_LANE"; exit 0; fi
+      done
+    fi
     exit 0
   fi
 done
@@ -94,6 +101,12 @@ printf '# T4 · after a dialog\n' >"$HOME/Downloads/t4.md"
 check "the relay answers Claude Code's exit dialog with 1, then launches" wait_for "grep -q 'T4 · lane A' '$HOME/claude-args-A' 2>/dev/null" 80
 check "the dialog got exactly the key 1" grep -qx 'dialog-key 1' "$HOME/claude-input-A"
 rm -f "$HOME/dialog-A"
+touch "$HOME/feedback-A"
+printf '# T5 · after a feedback-draft prompt\n' >"$HOME/Downloads/t5.md"
+"$CCP" queue A t5.md opus task --exit >/dev/null
+check "the relay answers Claude Code's feedback-draft prompt with Esc, then launches" wait_for "grep -q 'T5 · lane A' '$HOME/claude-args-A' 2>/dev/null" 80
+check "the feedback-draft prompt got Esc, never Enter" bash -c "grep -qx 'feedback-key ESC' '$HOME/claude-input-A' && ! grep -q 'feedback-key ENTER' '$HOME/claude-input-A'"
+rm -f "$HOME/feedback-A"
 check "the done marker is used once" test ! -e "$XDG_STATE_HOME/cc-parallel/status/A.done"
 check "done outside a lane is refused" bash -c "! env -u CC_PARALLEL_LANE '$CCP' done 2>/dev/null"
 check "done --lane marks a lane started some other way" bash -c "'$CCP' done --lane B Q9 >/dev/null && grep -q '^Q9 ' '$XDG_STATE_HOME/cc-parallel/status/B.done'"
