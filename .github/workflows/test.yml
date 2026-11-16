@@ -5,13 +5,40 @@ on:
 permissions:
   contents: read
 jobs:
-  test:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install tmux and shellcheck
         run: sudo apt-get update && sudo apt-get install -y tmux shellcheck
       - name: shellcheck
-        run: shellcheck -S warning bin/cc-parallel tests/smoke.sh
+        run: shellcheck -S warning bin/cc-parallel tests/*.sh
       - name: smoke test (stub claude)
+        run: bash tests/smoke.sh
+      - name: smoke test with BSD-style tools (a GNU-only flag fails here before it reaches a Mac)
+        run: bash tests/bsd-smoke.sh
+
+  macos:
+    runs-on: macos-latest
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bash and tmux (macOS ships bash 3.2 and no tmux)
+        run: brew install bash tmux
+      - name: under macOS's own bash 3.2, cc-parallel hands over to Homebrew's bash
+        run: /bin/bash bin/cc-parallel --version
+      - name: smoke test (stub claude)
+        run: PATH="$(brew --prefix)/bin:$PATH" bash tests/smoke.sh
+
+  windows-wsl:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: tmux git
+      - name: smoke test inside WSL (stub claude)
+        shell: wsl-bash {0}
         run: bash tests/smoke.sh

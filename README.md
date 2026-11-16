@@ -42,6 +42,13 @@ One bash script (`cc-parallel`), tmux and git. No daemon, no account, no network
 
 ## Install
 
+You need bash 4+, tmux 3+, git, and Claude Code installed and signed in (`claude` on your PATH). Parallel runs on
+Linux, on macOS and on Windows inside WSL2, and CI runs its tests on all three on every push.
+
+### Linux
+
+Install tmux and git with your package manager (on Debian and Ubuntu, `sudo apt install tmux git`), then:
+
 ```
 git clone https://github.com/tjag01/parallel ~/parallel
 ```
@@ -56,13 +63,41 @@ cc-parallel --version
 ```
 
 If the last command says `command not found`, `~/.local/bin` is not on your PATH yet. Add
-`export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` (or `~/.zshrc` on macOS), then open a new terminal.
+`export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc`, then open a new terminal.
+
+### macOS
+
+macOS comes with bash 3.2 and no tmux. Install both from [Homebrew](https://brew.sh):
+
+```
+brew install bash tmux
+```
+
+Then follow the four Linux steps above, putting the PATH line in `~/.zshrc`. You do not need to change your login
+shell: when `cc-parallel` finds itself under bash 3.2, it hands over to Homebrew's bash.
+
+- `cc-parallel install-app` puts `Parallel Wall.command` in `~/Applications`. Double-click it, or keep it in the Dock,
+  to open the wall in Terminal.
+- tmux on macOS names a pane after its program. If `cc-parallel status` shows a lane's PANE as something other than
+  `claude` while Claude Code runs in it (an npm install shows `node`), add that name to `CC_PROCS` in the config.
+  `cc-parallel up` points this out for an npm install.
+
+### Windows
+
+tmux needs a Unix terminal, so on Windows Parallel runs inside WSL2. In PowerShell, as administrator:
+
+```
+wsl --install -d Ubuntu
+```
+
+Then, in the Ubuntu terminal, install tmux and git, install Claude Code inside Ubuntu, and follow the Linux steps.
+Keep your repositories in your WSL home (`~`), not under `/mnt/c`. [docs/WINDOWS.md](docs/WINDOWS.md) has the
+details, including reading task files from your Windows Downloads folder and a Windows Terminal profile for the wall.
+
+### Updating
 
 To update later: `git -C ~/parallel pull`. To pin a release instead of following `main`:
-`git -C ~/parallel checkout v0.2.2`.
-
-You need bash 4+, tmux 3+, git, and Claude Code installed and signed in (`claude` on your PATH). It is tested on
-Linux, and should work on macOS with Homebrew bash.
+`git -C ~/parallel checkout v0.2.7`.
 
 ## Quick start
 
@@ -122,7 +157,8 @@ change:
 | `MODELS`, `DEFAULT_MODEL` | `opus sonnet`, `opus` | What a launch may name. |
 | `CLAUDE_FLAGS` | empty | Extra flags for every launch. See "Permissions" below. |
 | `LAUNCH_SETTINGS_EXTRA` | empty | JSON object members, without the braces, put first in the `--settings` each launch passes, e.g. `'"enabledPlugins":{"some-plugin@marketplace":false}'` to turn a plugin off for lanes only. Empty: the settings are only the hooks. |
-| `ON_CHANGE` | empty | For example `notify-send "lane $LANE is $STATE"`. |
+| `ON_CHANGE` | empty | A command to run when a lane turns idle or waiting. `init` writes an example for your system: `notify-send` on Linux, `osascript` on macOS, a beep on WSL. |
+| `CC_PROCS` | `claude` and a version number | What tmux calls a pane while Claude Code runs in it (globs). The relay types into a lane only when its pane matches. |
 | `LANE_DIR_<X>` | — | Put one lane anywhere. |
 | `GC_GLOBS` | empty | Build caches the relay may remove, as globs under each lane, e.g. `target/*-scratch/clone/target`. It runs after a lane says done, and whenever free disk falls below `GC_MIN_FREE_GB` (100). It never touches a lane's current task, anything used in the last `GC_MIN_AGE_MIN` (60) minutes, or a lane's own `target/`. `cc-parallel gc --dry-run` shows what it would remove. |
 
@@ -160,6 +196,14 @@ bash tests/smoke.sh
 
 This runs an end-to-end check against a stub `claude` in a throwaway HOME and tmux server. It covers six lanes:
 launch, send, the rejections, exit-then-launch, the hooks, `ON_CHANGE`, status, and the walls.
+
+```
+bash tests/bsd-smoke.sh
+```
+
+This runs the same test with BSD-style tools, as on macOS: GNU-only flags are refused and GNU-only tools are absent,
+so a Linux-only habit fails before it reaches a Mac. CI runs the smoke test on Linux, on macOS and inside WSL on
+Windows.
 
 ## Licence
 

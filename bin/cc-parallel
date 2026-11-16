@@ -7,10 +7,55 @@
 #   https://github.com/tjag01/parallel
 #
 # MIT licence. Requires bash 4+, tmux 3+, git, and Claude Code (`claude` on PATH).
+# Runs on Linux, on macOS (with Homebrew's bash and tmux) and on Windows inside WSL2.
+
+# bash 4+ is needed (associative arrays, ${x,,}, mapfile). macOS ships bash 3.2, so hand over to Homebrew's bash
+# when it is installed. Keep this block in bash-3 syntax: nothing below it is read until it has passed.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  if [ -z "${CC_PARALLEL_REEXEC:-}" ]; then
+    for b in /opt/homebrew/bin/bash /usr/local/bin/bash /home/linuxbrew/.linuxbrew/bin/bash; do
+      [ -x "$b" ] && CC_PARALLEL_REEXEC=1 exec "$b" "$0" "$@"
+    done
+  fi
+  echo "cc-parallel: needs bash 4 or newer; this is bash ${BASH_VERSION:-unknown}. On macOS: brew install bash" >&2
+  exit 2
+fi
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "cc-parallel: on Windows, run Parallel inside WSL2 (tmux needs a Unix terminal); see docs/WINDOWS.md" >&2
+    exit 2 ;;
+esac
 set -uo pipefail
 
-VERSION="0.2.6"
-SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+VERSION="0.2.7"
+OS="$(uname -s 2>/dev/null || echo unknown)"
+IS_WSL=0; case "$(uname -r 2>/dev/null)" in *[Mm]icrosoft*|*WSL*) IS_WSL=1 ;; esac
+
+# Portable helpers: one form for GNU tools (Linux, WSL) and BSD tools (macOS).
+abs_path() { # a file's absolute path with every symlink resolved (macOS before 12.3 has no readlink -f)
+  local p="$1" d
+  while [ -L "$p" ]; do
+    d="$(cd -P -- "$(dirname -- "$p")" && pwd)" || return 1
+    p="$(readlink -- "$p")" || return 1
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  d="$(cd -P -- "$(dirname -- "$p")" && pwd)" || return 1
+  printf '%s/%s\n' "$d" "$(basename -- "$p")"
+}
+abs_dir() { (cd -P -- "$1" 2>/dev/null && pwd); }       # a directory's absolute path, symlinks resolved
+if stat -c %Y -- / >/dev/null 2>&1; then
+  mtime() { stat -c %Y -- "$1" 2>/dev/null; }             # GNU stat: seconds since the epoch
+else
+  mtime() { stat -f %m -- "$1" 2>/dev/null; }             # BSD stat (macOS)
+fi
+fsize() { local n; n="$(wc -c 2>/dev/null <"$1")" || return 1; printf '%d' "$((n))"; }   # BSD wc pads with spaces
+if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum -- "$1"; }
+elif command -v shasum >/dev/null 2>&1; then sha256() { shasum -a 256 -- "$1"; }          # macOS
+else sha256() { openssl dgst -sha256 -r "$1"; }; fi
+first_line() { local t=""; IFS= read -r t <"$1" 2>/dev/null; printf '%s' "${t%$'\r'}"; }  # a file saved on Windows ends lines in CR
+on_windows_drive() { [ "$IS_WSL" = 1 ] && case "$1" in /mnt/[a-zA-Z]|/mnt/[a-zA-Z]/*) true ;; *) false ;; esac; }
+
+SELF="$(abs_path "${BASH_SOURCE[0]}")"
 CONF="${CC_PARALLEL_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/cc-parallel/config}"
 CONF_DIR="$(dirname "$CONF")"
 
@@ -29,7 +74,8 @@ CLAUDE_BIN="claude"                # the Claude Code command
 CLAUDE_FLAGS=""                    # extra flags for every launch, e.g. "--dangerously-skip-permissions" (read the README first)
 LAUNCH_SETTINGS_EXTRA=""           # JSON object members (no braces) put first in every launch's --settings, e.g. '"enabledPlugins":{"x@y":false}'
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cc-parallel"
-CC_PROCS="claude"                  # pane commands that mean "Claude Code is running in this lane"
+CC_PROCS="claude [0-9]*.[0-9]*.[0-9]*"   # pane commands (globs) that mean "Claude Code is running in this lane". tmux on
+                                   # macOS names a pane by its executable, and the native installer's is named by version
 RELAY_TEXT='Read {path} whole (sha256 starts {sha8}) and follow it.'
 ON_CHANGE=""                       # run when a lane turns idle or waiting; gets LANE, STATE, EVENT in its env
 POLL=10                            # relay poll, seconds
@@ -62,7 +108,7 @@ lane_dir() { # lane -> its directory
 need_repo() { [ -n "$REPO" ] || die "no REPO set; run: cc-parallel init --repo <path>"; }
 # A window by exact name, as session:index. tmux refuses a name two windows share, so never target by name.
 win() { local i; i="$(tmux list-windows -t "=$SESSION" -F '#{window_index} #{window_name}' 2>/dev/null | awk -v n="$1" '$2 == n { print $1; exit }')"; [ -n "$i" ] && printf '%s:%s' "$SESSION" "$i"; }
-sha8() { sha256sum -- "$1" 2>/dev/null | cut -c1-8; }
+sha8() { sha256 "$1" 2>/dev/null | cut -c1-8; }
 now() { date -u +%FT%TZ; }
 
 RELAY="$STATE_DIR/relay"
@@ -75,7 +121,7 @@ cmd_init() {
   local n="" repo="" lanes_arg=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo) repo="$(readlink -f "$2")"; shift 2 ;;
+      --repo) repo="$(abs_dir "$2")" || die "init: no directory $2"; shift 2 ;;
       --lanes) n="$2"; shift 2 ;;
       --names) lanes_arg="$2"; shift 2 ;;
       *) die "init: unknown argument $1" ;;
@@ -90,6 +136,11 @@ cmd_init() {
   fi
   REPO="$repo"
   mkdir -p "$CONF_DIR/kickoff"
+  # shellcheck disable=SC2016  # $LANE and $STATE are for ON_CHANGE to expand when it runs
+  local onchange='notify-send "lane $LANE is $STATE"'                         # a desktop notification, per system
+  # shellcheck disable=SC2016
+  [ "$OS" = Darwin ] && onchange='osascript -e "display notification \"lane $LANE is $STATE\" with title \"Parallel\""'
+  [ "$IS_WSL" = 1 ] && onchange='powershell.exe -NoProfile -Command "[console]::beep(880,300)"'
   if [ -f "$CONF" ]; then
     echo "config exists, left as it is: $CONF (edit LANES and REPO there to change lanes)"
   else
@@ -105,9 +156,14 @@ MODELS="$MODELS"
 DEFAULT_MODEL="$DEFAULT_MODEL"
 DEFAULT_MODE="$DEFAULT_MODE"
 CLAUDE_FLAGS=""
-# ON_CHANGE='notify-send "lane \$LANE is \$STATE"'
+# ON_CHANGE='$onchange'
 EOF
     echo "wrote $CONF"
+  fi
+  mkdir -p "$PROMPT_DIR" 2>/dev/null || true
+  if [ "$IS_WSL" = 1 ]; then
+    on_windows_drive "$REPO" && echo "note: $REPO is on a Windows drive; git and builds are much faster with the repo in your WSL home (~). See docs/WINDOWS.md" >&2
+    echo "note (WSL): task files are read from PROMPT_DIR=$PROMPT_DIR; to use your Windows Downloads folder, set PROMPT_DIR in $CONF to /mnt/c/Users/<your Windows user>/Downloads"
   fi
   write_default_kickoffs
   local l d
@@ -144,9 +200,24 @@ EOF
 # ---------------------------------------------------------------------------------------------------------------
 # up: the tmux session (a "relay" window plus one window per lane) and the relay watcher.
 # ---------------------------------------------------------------------------------------------------------------
+claude_node_hint() { # macOS names a pane by its executable, so an npm-installed Claude Code shows as "node"
+  local cb first=""
+  case " $CC_PROCS " in *" node "*) return 0 ;; esac
+  cb="$(command -v "$CLAUDE_BIN" 2>/dev/null)" && [ -f "$cb" ] || return 0
+  cb="$(abs_path "$cb")" || return 0
+  IFS= read -r first <"$cb" 2>/dev/null || true
+  case "$first" in '#!'*node*) echo "note: Claude Code runs under node here (an npm install), so tmux names its pane \"node\"; add to $CONF: CC_PROCS=\"claude node\"" >&2 ;; esac
+  return 0
+}
 cmd_up() {
   need_repo
-  command -v tmux >/dev/null || die "tmux is not installed"
+  command -v tmux >/dev/null || die "tmux is not installed$([ "$OS" = Darwin ] && echo " (brew install tmux)")"
+  [ "$OS" = Darwin ] && claude_node_hint
+  if [ "$IS_WSL" = 1 ]; then
+    local x; for x in $LANES; do
+      on_windows_drive "$(lane_dir "$x")" && { echo "note: lane $x is on a Windows drive ($(lane_dir "$x")); git and builds are much faster in your WSL home (~). See docs/WINDOWS.md" >&2; break; }
+    done
+  fi
   if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
     relay_running || mkdir -p "$RELAY/log"
     if relay_running; then tmux new-session -d -s "$SESSION" -n shell -c "$HOME"
@@ -173,15 +244,18 @@ cmd_up() {
 # statusbar: each lane's tmux status line shows only: lane · model · sprint · time and date.
 label_model() { local v="MODEL_LABEL_$1"; printf '%s' "${!v:-$1}"; }
 sprint_name() { # task file -> "Q391 AND-DEVICE-1" (its first heading up to the colon, without "Sprint"/"·")
-  local t; t="$(sed -n '1{s/^# *//;s/:.*//;s/ *· */ /g;s/ Sprint / /;s/ Grounding / /;s/#//g;p;}' -- "$1" 2>/dev/null)"
+  local t; t="$(first_line "$1")"
+  [[ $t == \#* ]] && { t="${t#\#}"; t="${t#"${t%%[! ]*}"}"; }       # the heading's "# "
+  t="${t%%:*}"; t="${t//·/ }"; while [[ $t == *"  "* ]]; do t="${t//  / }"; done
+  t="${t/ Sprint / }"; t="${t/ Grounding / }"; t="${t//#/}"
   [ -n "$t" ] || t="$(basename -- "$1" .md)"; printf '%.48s' "$t"; }
 # bar: one lane's status-line segment, coloured by state (green working, amber waiting, red stopped for a ruling).
 lane_stopped() { # lane -> 0 when a STOP file is newer than the lane's last launch or relay
   [ -n "$STOP_GLOB" ] || return 1
   local d ref=0 f m; d="$(lane_dir "$1")"
-  [ -f "$STATUS/$1.code" ] && ref="$(stat -c %Y -- "$STATUS/$1.code" 2>/dev/null || echo 0)"
-  for f in "$RELAY/sent/$1"-*; do [ -e "$f" ] || continue; m="$(stat -c %Y -- "$f" 2>/dev/null || echo 0)"; [ "$m" -gt "$ref" ] && ref="$m"; done
-  for f in $d/$STOP_GLOB; do [ -e "$f" ] || continue; m="$(stat -c %Y -- "$f" 2>/dev/null || echo 0)"; [ "$m" -gt "$ref" ] && return 0; done
+  [ -f "$STATUS/$1.code" ] && ref="$(mtime "$STATUS/$1.code" || echo 0)"
+  for f in "$RELAY/sent/$1"-*; do [ -e "$f" ] || continue; m="$(mtime "$f" || echo 0)"; [ "$m" -gt "$ref" ] && ref="$m"; done
+  for f in $d/$STOP_GLOB; do [ -e "$f" ] || continue; m="$(mtime "$f" || echo 0)"; [ "$m" -gt "$ref" ] && return 0; done
   return 1
 }
 cmd_bar() {
@@ -191,7 +265,7 @@ cmd_bar() {
   [ -f "$STATUS/$l.label" ] && lab="$(<"$STATUS/$l.label")"
   now="$(date +%s)"
   if [ -f "$STATUS/$l.code" ]; then
-    since="$(stat -c %Y -- "$STATUS/$l.code" 2>/dev/null || echo "$now")"; el=$(( (now - since) / 60 ))
+    since="$(mtime "$STATUS/$l.code" || echo "$now")"; el=$(( (now - since) / 60 ))
     el="$(( el / 60 ))h$(printf '%02d' $(( el % 60 )))m"
   fi
   case "$st" in
@@ -283,13 +357,15 @@ cmd_launch() {
   fi
   local tpl="$CONF_DIR/kickoff/$mode.txt"
   [ -f "$tpl" ] || { write_default_kickoffs; [ -f "$tpl" ] || die "launch: no kickoff template $tpl"; }
-  local code; code="$(sed -n '1s/^# *\([A-Za-z0-9][A-Za-z0-9_.-]*\)[ :·].*/\1/p' -- "$path")"
+  local code="" re='^#[ ]*([A-Za-z0-9][A-Za-z0-9_.-]*)( |:|·)' first; first="$(first_line "$path")"
+  [[ $first =~ $re ]] && code="${BASH_REMATCH[1]}"
   [ -n "$code" ] || code="$(basename -- "$file" .md)"
   local prompt; prompt="$(<"$tpl")"
   prompt="${prompt//\{path\}/$path}"; prompt="${prompt//\{file\}/$file}"
   prompt="${prompt//\{lane\}/$lane}"; prompt="${prompt//\{code\}/$code}"
   prompt="${prompt//\{done\}/$SELF done $code}"
   local q; q="$(printf '%q' "$SELF")"
+  q="${q//\\/\\\\}"; q="${q//\"/\\\"}"        # as a JSON string: a path with a space is quoted with a backslash
   local settings
   settings=$(printf '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"%s hook working"}]}],"PreToolUse":[{"hooks":[{"type":"command","command":"%s hook working"}]}],"Notification":[{"hooks":[{"type":"command","command":"%s hook waiting"}]}],"Stop":[{"hooks":[{"type":"command","command":"%s hook idle"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"%s hook ended"}]}]}}' "$q" "$q" "$q" "$q" "$q")
   [ -z "$LAUNCH_SETTINGS_EXTRA" ] || settings="{$LAUNCH_SETTINGS_EXTRA,${settings:1}"   # the config's members first
@@ -388,7 +464,9 @@ cmd_relay() {
   local LOG="$RELAY/log/relay.log"
   log() { printf '%s %s\n' "$(now)" "$*" >>"$LOG"; }
   pane_cmd() { local w; w="$(win "$1")" && tmux display-message -p -t "$w" '#{pane_current_command}' 2>/dev/null; }
-  is_cc() { local c p; c="$(pane_cmd "$1")"; for p in $CC_PROCS; do [ "$c" = "$p" ] && return 0; done; return 1; }
+  is_cc() { local c p pats; c="$(pane_cmd "$1")"; [ -n "$c" ] || return 1; read -r -a pats <<<"$CC_PROCS"
+    # shellcheck disable=SC2254  # each entry is a glob
+    for p in "${pats[@]}"; do case "$c" in $p) return 0 ;; esac; done; return 1; }
   is_shell() { case "$(pane_cmd "$1")" in bash|zsh|sh|fish) return 0 ;; *) return 1 ;; esac; }
   has_win() { [ -n "$(win "$1")" ]; }
   reject() { log "REJECT $1: $2"; mv -n -- "$RELAY/inbox/$1" "$RELAY/rejected/$1"; }
@@ -437,7 +515,7 @@ cmd_relay() {
     lane="${BASH_REMATCH[1]}"; kind="${BASH_REMATCH[2]}"
     is_lane "$lane" || { reject "$f" "no lane $lane"; return; }
     [ -f "$path" ] && [ ! -L "$path" ] || { reject "$f" "not a regular file"; return; }
-    [ "$(stat -c %s -- "$path")" -lt 1024 ] || { reject "$f" "too large"; return; }
+    [ "$(fsize "$path")" -lt 1024 ] || { reject "$f" "too large"; return; }
     [ "$(grep -c '' -- "$path")" -eq 1 ] || { reject "$f" "not exactly one line"; return; }
     line="$(head -n1 -- "$path" | tr -d '\r')"
     [[ "$line" =~ ^[A-Za-z0-9\ ._-]+$ ]] || { reject "$f" "disallowed characters"; return; }
@@ -525,16 +603,16 @@ cmd_gc() {
   local l d g p real code sz n=0 freed=0
   for l in $LANES; do
     d="$(lane_dir "$l")"; [ -d "$d" ] || continue
-    d="$(readlink -f "$d")"
+    d="$(abs_dir "$d")" || continue
     code=""; [ -f "$STATUS/$l.code" ] && code="$(tr -d '[:space:]' <"$STATUS/$l.code")"
     for g in $GC_GLOBS; do
       for p in "$d"/$g; do
         [ -d "$p" ] && [ ! -L "$p" ] || continue
-        real="$(readlink -f "$p")"
+        real="$(abs_dir "$p")" || continue
         case "$real" in "$d"/*) ;; *) echo "gc: skip $p (outside lane $l)"; continue ;; esac
         [ "$real" = "$d/target" ] && { echo "gc: skip $p (the lane's own target)"; continue; }
         if [ -n "$code" ] && printf '%s' "${real,,}" | grep -qF -- "${code,,}"; then echo "gc: keep $p (lane $l's current task $code)"; continue; fi
-        if [ -n "$(find "$p" -maxdepth 2 -newermt "$GC_MIN_AGE_MIN minutes ago" -print -quit 2>/dev/null)" ]; then echo "gc: keep $p (used in the last $GC_MIN_AGE_MIN min)"; continue; fi
+        if [ -n "$(find "$p" -maxdepth 2 -mmin "-$GC_MIN_AGE_MIN" -print 2>/dev/null | head -n 1)" ]; then echo "gc: keep $p (used in the last $GC_MIN_AGE_MIN min)"; continue; fi
         sz="$(du -sk -- "$real" 2>/dev/null | cut -f1)"; sz="${sz:-0}"
         if [ "$dry" = 1 ]; then echo "gc: would remove $p ($((sz / 1048576)) GB)"; n=$((n + 1)); freed=$((freed + sz)); continue; fi
         if rm -rf -- "$real"; then echo "gc: removed $p ($((sz / 1048576)) GB)"; n=$((n + 1)); freed=$((freed + sz)); fi
@@ -547,6 +625,19 @@ free_gb() { df -Pk -- "$(lane_dir "$(first_lane)")" 2>/dev/null | awk 'NR==2 { p
 
 # ---------------------------------------------------------------------------------------------------------------
 cmd_install_app() {
+  if [ "$OS" = Darwin ]; then     # macOS: a file Terminal opens with a double-click (or from the Dock)
+    local m="$HOME/Applications" f
+    f="$m/Parallel Wall.command"; mkdir -p "$m"
+    # shellcheck disable=SC2016  # $PATH is for the .command file to expand when it runs
+    printf '#!/bin/bash\nexport PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"\nexec %s wall\n' "$(printf '%q' "$SELF")" >"$f" && chmod +x "$f"
+    echo "installed $f: double-click it (or drag it to the Dock) to open the wall in Terminal"
+    return 0
+  fi
+  if [ "$IS_WSL" = 1 ]; then      # Windows: a Windows Terminal profile is the launcher
+    echo "On Windows, add a Windows Terminal profile (Settings > Add a new profile) with this command line:"
+    echo "  wsl.exe -d ${WSL_DISTRO_NAME:-Ubuntu} -- $(printf '%q' "$SELF") wall"
+    return 0
+  fi
   local d="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   mkdir -p "$d"
   cat >"$d/cc-parallel.desktop" <<DESK
@@ -584,6 +675,7 @@ cc-parallel $VERSION: several Claude Code agents in parallel, one per git worktr
 Config: $CONF
 State:  $STATE_DIR
 Modes:  task, sprint, ground (read-only) and resume; edit the templates in $CONF_DIR/kickoff/
+Runs on Linux, macOS (brew install bash tmux) and Windows inside WSL2 (docs/WINDOWS.md)
 EOF
 }
 

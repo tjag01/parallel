@@ -2,7 +2,7 @@
 # tests/smoke.sh: an end-to-end check of cc-parallel with a stub `claude`, in a throwaway HOME and tmux server.
 # Needs tmux and git. Run from the repo root: bash tests/smoke.sh
 set -uo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd -P "$(dirname "$0")/.." && pwd)"
 CCP="$ROOT/bin/cc-parallel"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ccp-smoke.XXXXXX")"
 TMUX_TMPDIR="$(mktemp -d /tmp/ccpt.XXXX)"  # short: a socket path is capped at ~100 bytes
@@ -16,14 +16,19 @@ ok() { echo "ok   $*"; pass=$((pass + 1)); }
 no() { echo "FAIL $*"; fail=$((fail + 1)); }
 check() { local d="$1"; shift; if "$@"; then ok "$d"; else no "$d"; fi; }
 wait_for() { for _ in $(seq 1 "${2:-40}"); do eval "$1" && return 0; sleep 0.25; done; return 1; }
+# The same on GNU (Linux, WSL) and BSD (macOS) tools:
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+ago() { local e=$(( $(date +%s) - $1 )); date -d "@$e" +%Y%m%d%H%M.%S 2>/dev/null || date -r "$e" +%Y%m%d%H%M.%S; }  # touch -t, N s ago
+sed_i() { local f="${*: -1}"; sed "${@:1:$#-1}" "$f" >"$f.new" && mv "$f.new" "$f"; }   # sed -i
 finish() { tmux kill-server 2>/dev/null; for s in "$TMUX_TMPDIR"/tmux-*/*; do tmux -S "$s" kill-server 2>/dev/null; done; }
 trap finish EXIT; [ -n "${KEEP:-}" ] && trap "finish; echo kept \$WORK" EXIT
 
-# A stub claude: records its arguments, then echoes every line it is sent; "/exit" ends it.
-cat >"$WORK/bin/claude" <<'EOF'
-#!/bin/bash
-# tmux names a pane's command from argv[0], so re-exec with argv[0] = claude, as the real binary has.
-[ -z "${STUBBED:-}" ] && STUBBED=1 exec -a claude /bin/bash "$0" "$@"
+# A stub claude: records its arguments, then echoes every line it is sent; "/exit" ends it. tmux names a pane after
+# its process, from argv[0] on Linux but from the executable's own name on macOS, so the stub runs under a copy of
+# bash that is itself named claude.
+mkdir -p "$WORK/stub"; cp "$(command -v bash)" "$WORK/stub/claude"
+printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$WORK/stub/claude" "$WORK/stub/claude.sh" >"$WORK/bin/claude"
+cat >"$WORK/stub/claude.sh" <<'EOF'
 printf '%s\n' "$@" >"$HOME/claude-args-$CC_PARALLEL_LANE"
 while IFS= read -r line; do
   printf '%s\n' "$line" >>"$HOME/claude-input-$CC_PARALLEL_LANE"
@@ -67,6 +72,7 @@ check "a queued launch starts Claude Code in lane A" wait_for "[ -f '$HOME/claud
 check "the launch passes the model" grep -qx opus "$HOME/claude-args-A"
 check "the launch passes the hooks through --settings" grep -q '"Stop"' "$HOME/claude-args-A"
 check "the kickoff names the file and the code" grep -q "\[T1 · lane A\] Read $HOME/Downloads/t1.md" "$HOME/claude-args-A"
+check "the status line names the sprint from its heading" grep -qx 'Opus 5.5 · T1 first task' "$XDG_STATE_HOME/cc-parallel/status/A.label"
 wait_for "[ \"\$(tmux display-message -p -t parallel:1 '#{pane_current_command}')\" = claude ]"
 
 tmux copy-mode -t parallel:1   # as if someone scrolled lane A back in the wall
@@ -78,7 +84,7 @@ printf 'r1.md deadbeef\n' >"$XDG_STATE_HOME/cc-parallel/relay/inbox/A-20260101T0
 check "a relay file with the wrong sha256 is rejected" wait_for "[ -f '$XDG_STATE_HOME/cc-parallel/relay/rejected/A-20260101T000000-relay.txt' ]"
 printf 'r1.md 12345678; rm -rf ~\n' >"$XDG_STATE_HOME/cc-parallel/relay/inbox/A-20260101T000001-relay.txt"
 check "a relay file with shell characters is rejected" wait_for "[ -f '$XDG_STATE_HOME/cc-parallel/relay/rejected/A-20260101T000001-relay.txt' ]"
-printf 'r1.md %s\n' "$(sha256sum "$HOME/Downloads/r1.md" | cut -c1-8)" >"$XDG_STATE_HOME/cc-parallel/relay/inbox/Q-20260101T000002-relay.txt"
+printf 'r1.md %s\n' "$(sha256 "$HOME/Downloads/r1.md" | cut -c1-8)" >"$XDG_STATE_HOME/cc-parallel/relay/inbox/Q-20260101T000002-relay.txt"
 check "a relay file for an unknown lane is rejected" wait_for "[ -f '$XDG_STATE_HOME/cc-parallel/relay/rejected/Q-20260101T000002-relay.txt' ]"
 
 printf '# T2 · second task\n' >"$HOME/Downloads/t2.md"
@@ -111,7 +117,7 @@ check "the done marker is used once" test ! -e "$XDG_STATE_HOME/cc-parallel/stat
 check "done outside a lane is refused" bash -c "! env -u CC_PARALLEL_LANE '$CCP' done 2>/dev/null"
 check "done --lane marks a lane started some other way" bash -c "'$CCP' done --lane B Q9 >/dev/null && grep -q '^Q9 ' '$XDG_STATE_HOME/cc-parallel/status/B.done'"
 
-sed -i "s|^# ON_CHANGE=.*|ON_CHANGE='echo \"\$LANE \$STATE\" >>\"\$HOME/changes\"'|" "$XDG_CONFIG_HOME/cc-parallel/config"
+sed_i "s|^# ON_CHANGE=.*|ON_CHANGE='echo \"\$LANE \$STATE\" >>\"\$HOME/changes\"'|" "$XDG_CONFIG_HOME/cc-parallel/config"
 kill "$(cat "$XDG_STATE_HOME/cc-parallel/relay/log/relay.pid")" 2>/dev/null; sleep 1
 "$CCP" up >/dev/null
 wait_for "grep -q 'START relay' '$XDG_STATE_HOME/cc-parallel/relay/log/relay.log'"
@@ -130,7 +136,7 @@ check "a wall of a subset shows only those lanes" test "$(tmux -L parallel-wall-
 # gc: old caches go; the current task's, a fresh one, the lane's own target/ and anything outside the globs stay.
 LB="$WORK/repo-lanes/b"; LC="$WORK/repo-lanes/c"
 mkdir -p "$LB/target/q1-scratch/clone/target/debug" "$LB/target/q2-scratch/clone/target/debug" "$LC/target/q3-scratch/clone/target/debug" "$LB/target/debug" "$LB/keepme/clone/target"
-touch -d '3 hours ago' "$LB/target/q1-scratch/clone/target/debug" "$LB/target/q1-scratch/clone/target" "$LB/target/q2-scratch/clone/target/debug" "$LB/target/q2-scratch/clone/target"
+touch -t "$(ago 10800)" "$LB/target/q1-scratch/clone/target/debug" "$LB/target/q1-scratch/clone/target" "$LB/target/q2-scratch/clone/target/debug" "$LB/target/q2-scratch/clone/target"
 echo 'Q2' >"$XDG_STATE_HOME/cc-parallel/status/B.code"
 printf 'GC_GLOBS="target/*-scratch/clone/target target"\n' >>"$XDG_CONFIG_HOME/cc-parallel/config"
 check "gc --dry-run lists without removing" bash -c "'$CCP' gc --dry-run | grep -q 'would remove .*q1-scratch' && [ -d '$LB/target/q1-scratch/clone/target' ]"
@@ -148,14 +154,40 @@ printf 'Opus · Q2 Two\n' >"$SD/B.label"; printf 'working 0 hook\n' >"$SD/B"
 check "bar: a working lane is green and shows lane, label and time" bash -c "'$CCP' bar B | grep -q '^#\[bg=colour34,fg=black\] B · Opus · Q2 Two · 0h0[0-9]m #\[default\]\$'"
 printf 'waiting 0 hook\n' >"$SD/B"
 check "bar: a waiting lane is amber" bash -c "'$CCP' bar B | grep -q 'bg=colour214'"
-mkdir -p "$LB/target/q2-scratch/drafts"; touch -d '+1 min' "$LB/target/q2-scratch/drafts/STOP_QUESTIONS.md"
+mkdir -p "$LB/target/q2-scratch/drafts"; touch -t "$(ago -60)" "$LB/target/q2-scratch/drafts/STOP_QUESTIONS.md"
 check "bar: a stop file newer than the launch makes the lane red, with STOP" bash -c "'$CCP' bar B | grep -q 'bg=colour196.* · STOP '"
-touch -d '1 day ago' "$LB/target/q2-scratch/drafts/STOP_QUESTIONS.md"
+touch -t "$(ago 86400)" "$LB/target/q2-scratch/drafts/STOP_QUESTIONS.md"
 check "bar: an older stop file does not" bash -c "! '$CCP' bar B | grep -q STOP"
 "$CCP" statusbar >/dev/null 2>&1
 check "statusbar: the lanes' status line runs cc-parallel bar" bash -c "tmux show -t parallel -v status-left | grep -q 'bar #{window_name}'"
 check "statusbar: the window list is hidden" test -z "$(tmux show -w -t parallel:B -v window-status-format 2>/dev/null)"
 check "statusbar: an open wall shows only the time" test "$(tmux -L parallel-wall-A_C show -gv status-right)" = " %H:%M %d-%b-%y "
+
+# macOS's tmux names a pane by its executable, and Claude Code's native installer runs a binary named by its version.
+mkdir -p "$WORK/stub2"; cp "$(command -v bash)" "$WORK/stub2/2.1.31"
+printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$WORK/stub2/2.1.31" "$WORK/stub/claude.sh" >"$WORK/bin/claude-v"; chmod +x "$WORK/bin/claude-v"
+tmux send-keys -t parallel:D "CC_PARALLEL_LANE=D '$WORK/bin/claude-v'" Enter
+wait_for "[ \"\$(tmux display-message -p -t parallel:D '#{pane_current_command}')\" = 2.1.31 ]"
+"$CCP" send D r1.md >/dev/null
+check "a pane named by Claude Code's version counts as Claude Code" wait_for "grep -q 'Read $HOME/Downloads/r1.md whole' '$HOME/claude-input-D' 2>/dev/null"
+
+# Paths: through a symlink, and with a space (the hooks' command must still be valid JSON for --settings).
+ln -s "$CCP" "$WORK/bin/ccp-link"
+check "a symlinked cc-parallel finds its real path" bash -c "'$WORK/bin/ccp-link' launch E t1.md opus task </dev/null >/dev/null 2>&1; grep -q '$CCP done T1' '$HOME/claude-args-E'"
+mkdir -p "$WORK/with space/bin"; cp "$CCP" "$WORK/with space/bin/cc-parallel"
+"$WORK/with space/bin/cc-parallel" launch F t1.md opus task </dev/null >/dev/null 2>&1
+if command -v python3 >/dev/null 2>&1; then
+  check "a path with a space gives valid --settings JSON" python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["hooks"]["Stop"][0]["hooks"][0]["command"].startswith(sys.argv[2])' "$(sed -n 4p "$HOME/claude-args-F")" "$WORK/with\\ space/bin/cc-parallel hook"
+else
+  check "a path with a space gives valid --settings JSON" grep -qF 'with\\ space/bin/cc-parallel hook idle' "$HOME/claude-args-F"
+fi
+
+# Systems: a native Windows shell is pointed to WSL2; WSL and macOS each get their own launcher.
+fake_uname() { mkdir -p "$WORK/uname-$1"; printf '#!/bin/sh\ncase "$1" in -r) echo "%s" ;; *) echo "%s" ;; esac\n' "$3" "$2" >"$WORK/uname-$1/uname"; chmod +x "$WORK/uname-$1/uname"; }
+fake_uname win MINGW64_NT-10.0-19045 3.4.10; fake_uname wsl Linux 5.15.167.4-microsoft-standard-WSL2; fake_uname mac Darwin 24.1.0
+check "on a native Windows shell, cc-parallel points to WSL2" bash -c "! PATH='$WORK/uname-win:$PATH' '$CCP' status >/dev/null 2>'$WORK/win.err' && grep -q 'inside WSL2' '$WORK/win.err'"
+check "on WSL, install-app gives a Windows Terminal command line" bash -c "PATH='$WORK/uname-wsl:$PATH' '$CCP' install-app | grep -q 'wsl.exe -d'"
+check "on macOS, install-app makes a double-clickable .command" bash -c "PATH='$WORK/uname-mac:$PATH' '$CCP' install-app >/dev/null && [ -x '$HOME/Applications/Parallel Wall.command' ] && grep -q ' wall\$' '$HOME/Applications/Parallel Wall.command'"
 
 check "nothing in the inbox was deleted: every file is in sent/ or rejected/" test "$(ls "$XDG_STATE_HOME/cc-parallel/relay/inbox"/*.txt 2>/dev/null | wc -l)" -eq 0
 
