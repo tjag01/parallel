@@ -8,7 +8,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install tmux and shellcheck
         run: sudo apt-get update && sudo apt-get install -y tmux shellcheck
       - name: shellcheck
@@ -23,7 +23,7 @@ jobs:
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install bash and tmux (macOS ships bash 3.2 and no tmux)
         run: brew install bash tmux
       - name: under macOS's own bash 3.2, cc-parallel hands over to Homebrew's bash
@@ -34,7 +34,7 @@ jobs:
   windows-wsl:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: Vampire/setup-wsl@v7
         with:
           distribution: Ubuntu-24.04

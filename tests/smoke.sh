@@ -4,7 +4,7 @@
 set -uo pipefail
 ROOT="$(cd -P "$(dirname "$0")/.." && pwd)"
 CCP="$ROOT/bin/cc-parallel"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/ccp-smoke.XXXXXX")"
+WORK="$(cd -P -- "$(mktemp -d "${TMPDIR:-/tmp}/ccp-smoke.XXXXXX")" && pwd)"  # physical: macOS TMPDIR is /var/..., a link to /private/var/..., and cc-parallel resolves its own path
 TMUX_TMPDIR="$(mktemp -d /tmp/ccpt.XXXX)"  # short: a socket path is capped at ~100 bytes
 export HOME="$WORK/home" TMUX_TMPDIR
 # 
@@ -139,7 +139,10 @@ mkdir -p "$LB/target/q1-scratch/clone/target/debug" "$LB/target/q2-scratch/clone
 touch -t "$(ago 10800)" "$LB/target/q1-scratch/clone/target/debug" "$LB/target/q1-scratch/clone/target" "$LB/target/q2-scratch/clone/target/debug" "$LB/target/q2-scratch/clone/target"
 echo 'Q2' >"$XDG_STATE_HOME/cc-parallel/status/B.code"
 printf 'GC_GLOBS="target/*-scratch/clone/target target"\n' >>"$XDG_CONFIG_HOME/cc-parallel/config"
-check "gc --dry-run lists without removing" bash -c "'$CCP' gc --dry-run | grep -q 'would remove .*q1-scratch' && [ -d '$LB/target/q1-scratch/clone/target' ]"
+mkdir -p "$LB/target/q21-scratch/clone/target/debug"; touch -t "$(ago 10800)" "$LB/target/q21-scratch/clone/target/debug" "$LB/target/q21-scratch/clone/target"
+"$CCP" gc --dry-run >"$WORK/gc-dry.out" 2>&1  # to a file: grep -q on a pipe closes it early and cc-parallel's next echo hits a broken pipe
+check "gc --dry-run lists without removing" bash -c "grep -q 'would remove .*q1-scratch' '$WORK/gc-dry.out' && [ -d '$LB/target/q1-scratch/clone/target' ]"
+check "gc does not keep q21's cache for the current task Q2 (the code matches a whole name, not a substring)" grep -q 'would remove .*q21-scratch' "$WORK/gc-dry.out"
 "$CCP" gc >/dev/null
 check "gc removes an old cache of a finished task" test ! -e "$LB/target/q1-scratch/clone/target"
 check "gc keeps the lane's current task's cache" test -d "$LB/target/q2-scratch/clone/target"
