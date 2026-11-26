@@ -97,7 +97,7 @@ details, including reading task files from your Windows Downloads folder and a W
 ### Updating
 
 To update later: `git -C ~/parallel pull`. To pin a release instead of following `main`:
-`git -C ~/parallel checkout v0.2.7`.
+`git -C ~/parallel checkout v0.2.8`.
 
 ## Quick start
 
