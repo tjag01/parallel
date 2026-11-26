@@ -27,7 +27,7 @@ case "$(uname -s 2>/dev/null)" in
 esac
 set -uo pipefail
 
-VERSION="0.2.7"
+VERSION="0.2.8"
 OS="$(uname -s 2>/dev/null || echo unknown)"
 IS_WSL=0; case "$(uname -r 2>/dev/null)" in *[Mm]icrosoft*|*WSL*) IS_WSL=1 ;; esac
 
@@ -597,6 +597,13 @@ cmd_relay() {
 # status/<lane>.code appears nowhere in the path), and were not touched for GC_MIN_AGE_MIN minutes. Everything else is
 # left. Each removal is logged with its size. --dry-run lists, removes nothing.
 # ---------------------------------------------------------------------------------------------------------------
+# is_task_path REL CODE: does a path under a lane name the task CODE as a whole name? Only the part below the lane dir is
+# read (a temp dir's random name must not match), and only whole names count (task Q2 must not keep q21-scratch).
+is_task_path() {
+  local rel="${1,,}" code="${2,,}"
+  code="${code//./\\.}"
+  [[ "$rel" =~ (^|[^a-z0-9])${code}([^a-z0-9]|$) ]]
+}
 cmd_gc() {
   local dry=0; [ "${1:-}" = --dry-run ] && dry=1
   [ -n "$GC_GLOBS" ] || { echo "gc: GC_GLOBS is empty; nothing is collected (set it in $CONF)"; return 0; }
@@ -611,7 +618,7 @@ cmd_gc() {
         real="$(abs_dir "$p")" || continue
         case "$real" in "$d"/*) ;; *) echo "gc: skip $p (outside lane $l)"; continue ;; esac
         [ "$real" = "$d/target" ] && { echo "gc: skip $p (the lane's own target)"; continue; }
-        if [ -n "$code" ] && printf '%s' "${real,,}" | grep -qF -- "${code,,}"; then echo "gc: keep $p (lane $l's current task $code)"; continue; fi
+        if [ -n "$code" ] && is_task_path "${real#"$d"/}" "$code"; then echo "gc: keep $p (lane $l's current task $code)"; continue; fi
         if [ -n "$(find "$p" -maxdepth 2 -mmin "-$GC_MIN_AGE_MIN" -print 2>/dev/null | head -n 1)" ]; then echo "gc: keep $p (used in the last $GC_MIN_AGE_MIN min)"; continue; fi
         sz="$(du -sk -- "$real" 2>/dev/null | cut -f1)"; sz="${sz:-0}"
         if [ "$dry" = 1 ]; then echo "gc: would remove $p ($((sz / 1048576)) GB)"; n=$((n + 1)); freed=$((freed + sz)); continue; fi
